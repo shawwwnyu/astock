@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>隔夜雷达</title>
+  <style>
+    :root {
+      --ink: #172024;
+      --muted: #637077;
+      --line: #d8dee1;
+      --line-soft: #e8ecee;
+      --paper: #ffffff;
+      --ground: #edf0f2;
+      --up: #bd332d;
+      --up-soft: #fff1ef;
+      --down: #177044;
+      --down-soft: #edf8f1;
+      --warn: #946100;
+      --warn-soft: #fff6dc;
+      --blue: #23699d;
+      --blue-soft: #edf5fa;
+      --violet: #82507e;
+      --orange: #bb741b;
+      --neutral: #7b878d;
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--ground); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    body { min-width: 320px; margin: 0; }
+    button, input { font: inherit; }
+    button { letter-spacing: 0; }
+    .app { width: min(1320px, 100%); min-height: 100vh; margin: 0 auto; background: var(--paper); }
+    .topbar { min-height: 66px; padding: 14px clamp(16px, 3.5vw, 42px); display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line); }
+    .brand-row { min-width: 0; display: flex; align-items: baseline; gap: 12px; }
+    .brand { margin: 0; font-size: 19px; line-height: 1.2; font-weight: 780; }
+    .phase { color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
+    .top-actions { display: flex; align-items: center; gap: 12px; }
+    .updated { color: var(--muted); font-size: 12px; text-align: right; }
+    .icon-button { width: 38px; height: 38px; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: white; color: var(--ink); font-size: 21px; line-height: 1; cursor: pointer; }
+    .icon-button:hover { background: #f5f7f8; border-color: #b7c1c6; }
+    .icon-button:focus-visible, .tab:focus-visible { outline: 3px solid #99c6e1; outline-offset: 2px; }
+    .icon-button[disabled] { cursor: wait; color: #a3adb2; }
+    .text-button { min-height: 38px; padding: 0 13px; border: 1px solid var(--line); border-radius: var(--radius); background: white; color: var(--ink); font-size: 13px; font-weight: 660; cursor: pointer; }
+    .text-button:hover { background: #f5f7f8; border-color: #b7c1c6; }
+    .text-button.primary { border-color: var(--blue); background: var(--blue); color: white; }
+    .text-button.primary:hover { background: #195782; }
+    .decision { min-height: 172px; padding: 26px clamp(18px, 4vw, 48px); display: grid; grid-template-columns: minmax(0, 1fr) 154px; align-items: center; gap: 32px; border-bottom: 1px solid var(--line); border-left: 7px solid var(--line); }
+    .decision.buy { background: var(--up-soft); border-left-color: var(--up); }
+    .decision.watch { background: var(--warn-soft); border-left-color: var(--warn); }
+    .decision.cash { background: var(--down-soft); border-left-color: var(--down); }
+    .eyebrow { margin: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 720; }
+    .headline { max-width: 960px; margin: 0; font-size: 36px; line-height: 1.16; letter-spacing: 0; overflow-wrap: anywhere; }
+    .decision-copy { max-width: 860px; margin: 12px 0 0; color: #3f494e; font-size: 15px; line-height: 1.65; }
+    .position-ring { width: 132px; height: 132px; justify-self: end; overflow: visible; }
+    .ring-track, .ring-progress { fill: none; stroke-width: 9; }
+    .ring-track { stroke: rgba(99, 112, 119, .18); }
+    .ring-progress { stroke: var(--neutral); stroke-linecap: round; }
+    .ring-progress.empty-ring { display: none; }
+    .decision.buy .ring-progress { stroke: var(--up); }
+    .decision.watch .ring-progress { stroke: var(--warn); }
+    .decision.cash .ring-progress { stroke: var(--down); }
+    .ring-number { fill: var(--ink); font-size: 22px; font-weight: 760; text-anchor: middle; }
+    .ring-label { fill: var(--muted); font-size: 10px; font-weight: 650; text-anchor: middle; }
+    .metric-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+    .metric { min-height: 98px; padding: 18px clamp(16px, 2.6vw, 30px); border-right: 1px solid var(--line); }
+    .metric:last-child { border-right: 0; }
+    .metric-label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+    .metric-value { display: block; font-size: 21px; line-height: 1.25; font-weight: 750; overflow-wrap: anywhere; }
+    .metric-note { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .green { color: var(--down); }
+    .yellow { color: var(--warn); }
+    .red { color: var(--up); }
+    .tabs { padding: 0 clamp(18px, 4vw, 48px); display: flex; align-items: flex-end; gap: 24px; border-bottom: 1px solid var(--line); }
+    .tab { min-height: 52px; padding: 0 2px; border: 0; border-bottom: 3px solid transparent; background: transparent; color: var(--muted); font-size: 14px; font-weight: 680; cursor: pointer; }
+    .tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--blue); }
+    .view[hidden] { display: none; }
+    .section { padding: 28px clamp(18px, 4vw, 48px); border-bottom: 1px solid var(--line); }
+    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .section-title { margin: 0; font-size: 18px; line-height: 1.35; }
+    .section-note { color: var(--muted); font-size: 12px; text-align: right; }
+    .market-board { border-top: 1px solid var(--line); }
+    .index-row { min-height: 58px; display: grid; grid-template-columns: 110px 104px minmax(180px, 1fr) 72px; align-items: center; gap: 16px; border-bottom: 1px solid var(--line-soft); }
+    .index-name { color: var(--muted); font-size: 12px; font-weight: 650; }
+    .index-value { font-size: 16px; font-weight: 720; font-variant-numeric: tabular-nums; }
+    .index-change { text-align: right; font-size: 13px; font-weight: 720; font-variant-numeric: tabular-nums; }
+    .index-track { position: relative; height: 12px; border-radius: 2px; background: #f1f3f4; overflow: hidden; }
+    .index-zero { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: #aeb8bd; }
+    .index-bar { position: absolute; top: 2px; bottom: 2px; min-width: 2px; border-radius: 1px; }
+    .index-bar.positive { left: 50%; background: var(--up); }
+    .index-bar.negative { right: 50%; background: var(--down); }
+    .index-bar.flat { left: calc(50% - 1px); background: var(--neutral); }
+    .gate-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .gate-step { min-width: 0; padding: 17px 18px; border-right: 1px solid var(--line); }
+    .gate-step:last-child { border-right: 0; }
+    .gate-marker { display: block; width: 34px; height: 4px; margin-bottom: 11px; border-radius: 1px; background: var(--neutral); }
+    .gate-step.red .gate-marker { background: var(--up); }
+    .gate-step.yellow .gate-marker { background: var(--warn); }
+    .gate-step.green .gate-marker { background: var(--down); }
+    .gate-label { display: block; color: var(--muted); font-size: 11px; }
+    .gate-value { display: block; margin-top: 5px; font-size: 14px; font-weight: 720; line-height: 1.45; overflow-wrap: anywhere; }
+    .candidate { margin-top: 20px; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .candidate:first-child { margin-top: 0; }
+    .candidate-header { padding: 19px 20px; display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; background: #fafbfb; border-bottom: 1px solid var(--line); }
+    .stock-name { margin: 0; font-size: 21px; line-height: 1.3; }
+    .stock-code { display: inline-block; margin-left: 8px; color: var(--muted); font-size: 13px; font-weight: 560; }
+    .stock-sub { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .candidate-action { text-align: right; }
+    .action-text { display: block; font-size: 15px; font-weight: 760; }
+    .action-position { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .candidate-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+    .candidate-stat { min-height: 82px; padding: 14px 16px; border-right: 1px solid var(--line); }
+    .candidate-stat:last-child { border-right: 0; }
+    .stat-label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 11px; }
+    .stat-value { display: block; font-size: 15px; line-height: 1.4; font-weight: 690; overflow-wrap: anywhere; }
+    .candidate-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .candidate-panel { min-width: 0; padding: 20px; }
+    .candidate-panel + .candidate-panel { border-left: 1px solid var(--line); }
+    .panel-title { margin: 0 0 14px; color: var(--muted); font-size: 12px; font-weight: 740; }
+    .facts { display: grid; grid-template-columns: minmax(96px, .42fr) minmax(0, 1fr); margin: 0; }
+    .facts dt, .facts dd { padding: 8px 0; border-top: 1px solid var(--line-soft); font-size: 13px; line-height: 1.55; }
+    .facts dt { color: var(--muted); }
+    .facts dd { margin: 0; font-weight: 610; overflow-wrap: anywhere; }
+    .facts dt:first-of-type, .facts dt:first-of-type + dd { border-top: 0; }
+    .risk-area { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; padding: 0 20px 20px; }
+    .compact-list { margin: 0; padding-left: 18px; }
+    .compact-list li { margin: 7px 0; font-size: 13px; line-height: 1.55; }
+    .timeline { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+    .timeline-step { padding: 17px 20px; border-right: 1px solid var(--line); }
+    .timeline-step:last-child { border-right: 0; }
+    .timeline-time { display: block; margin-bottom: 7px; color: var(--blue); font-size: 13px; font-weight: 760; }
+    .timeline-action { color: #3f494e; font-size: 13px; line-height: 1.55; }
+    .announcement { padding: 15px 20px; border-top: 1px solid var(--line); background: #fcfcfc; }
+    .announcement a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+    .announcement-row { margin: 6px 0; font-size: 12px; line-height: 1.5; }
+    .charts { padding: 20px; border-top: 1px solid var(--line); }
+    .chart-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 20px; margin-bottom: 10px; }
+    .chart-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 11px; }
+    .legend-key::before { content: ""; display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; background: currentColor; }
+    .ma5 { color: var(--blue); }
+    .ma10 { color: var(--orange); }
+    .ma20 { color: var(--violet); }
+    .price-chart { width: 100%; aspect-ratio: 16 / 6; min-height: 230px; }
+    .macd-chart { width: 100%; height: 132px; margin-top: 10px; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .empty { padding: 24px; border: 1px solid var(--line); border-left: 5px solid var(--down); border-radius: var(--radius); background: #fafcfb; }
+    .empty strong { display: block; margin-bottom: 8px; font-size: 17px; }
+    .empty p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+    table { width: 100%; min-width: 820px; border-collapse: collapse; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid var(--line-soft); text-align: left; font-size: 13px; line-height: 1.45; }
+    th { color: var(--muted); background: #f7f9f9; font-size: 11px; font-weight: 730; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: #fafcfc; }
+    .score { font-weight: 760; }
+    .score-track { width: 68px; height: 4px; margin-top: 6px; border-radius: 1px; background: #e8ecee; overflow: hidden; }
+    .score-fill { display: block; height: 100%; background: var(--blue); }
+    .fail-text { max-width: 340px; color: var(--muted); }
+    .breadth { margin-bottom: 20px; }
+    .breadth-labels { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-bottom: 9px; color: var(--muted); font-size: 12px; }
+    .breadth-labels strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+    .breadth-track { width: 100%; height: 12px; display: flex; overflow: hidden; border-radius: 2px; background: #edf0f2; }
+    .breadth-up { background: var(--up); }
+    .breadth-down { background: var(--down); }
+    .breadth-flat { background: var(--neutral); }
+    .diagnostics { margin-top: 18px; border-top: 1px solid var(--line-soft); padding-top: 14px; }
+    .diagnostics summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+    .diagnostics pre { margin: 12px 0 0; padding: 14px; overflow: auto; background: #f7f8f8; border: 1px solid var(--line); border-radius: var(--radius); color: #4b565b; font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
+    .source-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 24px; }
+    .source { color: var(--muted); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+    .source a { color: var(--blue); }
+    .footer { padding: 23px clamp(18px, 4vw, 48px) 38px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+    .loading { min-height: 450px; display: grid; place-items: center; padding: 30px; color: var(--muted); }
+    .error-box { max-width: 680px; padding: 22px; border: 1px solid #e5b9b4; border-left: 5px solid var(--up); border-radius: var(--radius); background: var(--up-soft); }
+    .error-box strong { display: block; margin-bottom: 8px; color: var(--up); }
+    dialog { width: min(520px, calc(100% - 28px)); padding: 0; border: 1px solid #bac4c9; border-radius: var(--radius); box-shadow: 0 18px 55px rgba(22, 31, 35, .2); color: var(--ink); }
+    dialog::backdrop { background: rgba(20, 28, 32, .38); }
+    .dialog-head { padding: 17px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); }
+    .dialog-title { margin: 0; font-size: 17px; }
+    .dialog-body { padding: 20px 18px; }
+    .field { display: block; margin-bottom: 18px; }
+    .field-label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .field-input { width: 100%; min-height: 42px; padding: 9px 11px; border: 1px solid #bfc8cc; border-radius: var(--radius); background: white; color: var(--ink); font-size: 13px; }
+    .field-input:focus { outline: 3px solid #bee0f2; border-color: var(--blue); }
+    .toggle-row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+    .push-status { min-height: 46px; margin: 18px 0 0; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: #f7f9f9; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .dialog-actions { padding: 15px 18px; display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--line); }
+
+    @media (max-width: 900px) {
+      .metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .gate-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .gate-step:nth-child(2) { border-right: 0; }
+      .gate-step:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .candidate-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .candidate-stat:nth-child(3) { border-right: 0; }
+      .candidate-stat:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
+      .source-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 680px) {
+      .topbar { align-items: flex-start; }
+      .brand-row { display: block; }
+      .phase { display: block; margin-top: 5px; }
+      .updated { display: none; }
+      .decision { min-height: 0; grid-template-columns: minmax(0, 1fr) 104px; gap: 14px; }
+      .headline { font-size: 29px; }
+      .position-ring { width: 96px; height: 96px; }
+      .metric-strip { grid-template-columns: 1fr; }
+      .metric { min-height: 82px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .metric:last-child { border-bottom: 0; }
+      .index-row { grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px 12px; padding: 12px 0; }
+      .index-value { grid-column: 2; text-align: right; }
+      .index-track { grid-column: 1 / -1; grid-row: 2; }
+      .index-change { grid-column: 3; grid-row: 1; }
+      .gate-flow { grid-template-columns: 1fr; }
+      .gate-step, .gate-step:nth-child(2) { border-right: 0; border-bottom: 1px solid var(--line); }
+      .gate-step:last-child { border-bottom: 0; }
+      .tabs { gap: 20px; }
+      .section-head { display: block; }
+      .section-note { margin-top: 6px; text-align: left; }
+      .candidate-header { flex-direction: column; }
+      .candidate-action { text-align: left; }
+      .candidate-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .candidate-stat { border-bottom: 1px solid var(--line); }
+      .candidate-stat:nth-child(odd) { border-right: 1px solid var(--line); }
+      .candidate-stat:nth-child(even) { border-right: 0; }
+      .candidate-stat:last-child { border-bottom: 0; }
+      .candidate-grid, .risk-area, .timeline { grid-template-columns: 1fr; }
+      .candidate-panel + .candidate-panel { border-left: 0; border-top: 1px solid var(--line); }
+      .timeline-step { border-right: 0; border-bottom: 1px solid var(--line); }
+      .timeline-step:last-child { border-bottom: 0; }
+      .price-chart { aspect-ratio: 4 / 3; min-height: 260px; }
+    }
+
+    @media (max-width: 430px) {
+      .topbar { gap: 10px; }
+      .top-actions { gap: 7px; }
+      .text-button { padding: 0 10px; }
+      .decision { grid-template-columns: 1fr; }
+      .position-ring { justify-self: start; width: 92px; height: 92px; }
+    }
+
+    @media print {
+      html { background: white; }
+      .app { width: 100%; }
+      .icon-button, .tabs { display: none; }
+      .candidate { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand-row">
+        <h1 class="brand">隔夜雷达</h1>
+        <span class="phase" id="phase">连接行情中</span>
+      </div>
+      <div class="top-actions">
+        <span class="updated" id="updated"></span>
+        <button class="text-button" id="push-settings" type="button">推送设置</button>
+        <button class="icon-button" id="refresh" type="button" title="刷新行情" aria-label="刷新行情">↻</button>
+      </div>
+    </header>
+
+    <div id="content" class="loading">正在获取当前行情与公告...</div>
+  </div>
+
+  <dialog id="push-dialog" aria-labelledby="push-dialog-title">
+    <div class="dialog-head">
+      <h2 class="dialog-title" id="push-dialog-title">企业微信推送</h2>
+      <button class="icon-button" id="push-close" type="button" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <form id="push-form">
+      <div class="dialog-body">
+        <label class="field">
+          <span class="field-label">消息推送 Webhook</span>
+          <input class="field-input" id="push-webhook" type="password" autocomplete="off" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+        </label>
+        <label class="toggle-row"><input id="push-enabled" type="checkbox">交易日 14:31 自动推送</label>
+        <div class="push-status" id="push-status">正在读取推送状态...</div>
+      </div>
+      <div class="dialog-actions">
+        <button class="text-button" id="push-test" type="button">发送测试</button>
+        <button class="text-button primary" type="submit">保存配置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    const state = { data: null, push: null, activeView: 'today', refreshing: false, timer: null };
+    const content = document.getElementById('content');
+    const refreshButton = document.getElementById('refresh');
+    const phaseNode = document.getElementById('phase');
+    const updatedNode = document.getElementById('updated');
+    const pushDialog = document.getElementById('push-dialog');
+    const pushStatusNode = document.getElementById('push-status');
+    const missing = '未核验';
+
+    const esc = (input) => String(input ?? missing).replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const num = (input, digits = 2) => Number.isFinite(Number(input)) ? Number(input).toLocaleString('zh-CN', {minimumFractionDigits: digits, maximumFractionDigits: digits}) : missing;
+    const money = (input) => Number.isFinite(Number(input)) ? `¥${Number(input).toLocaleString('zh-CN', {maximumFractionDigits: 0})}` : missing;
+    const tone = (input) => Number(input) > 0 ? 'red' : Number(input) < 0 ? 'green' : '';
+    const pct = (input) => `${Number(input) > 0 ? '+' : ''}${num(input)}%`;
+    const sourceLink = (source) => /^https?:\/\//.test(String(source.url || '')) ? `<a href="${esc(source.url)}" target="_blank" rel="noreferrer">${esc(source.name)}</a>` : esc(source.name);
+    const list = (items, fallback) => (Array.isArray(items) && items.length ? items : [fallback]).map((item) => `<li>${esc(item)}</li>`).join('');
+
+    async function loadData(force = false) {
+      if (state.refreshing) return;
+      state.refreshing = true;
+      refreshButton.disabled = true;
+      try {
+        const response = await fetch(`/api/analysis${force ? '?refresh=1' : ''}`, {cache: 'no-store'});
+        const payload = await response.json();
+        if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+        state.data = payload;
+        render();
+        loadPushStatus();
+      } catch (error) {
+        renderError(error.message || String(error));
+      } finally {
+        state.refreshing = false;
+        refreshButton.disabled = false;
+      }
+    }
+
+    async function postJSON(url, payload) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const raw = await response.text();
+      let result;
+      try {
+        result = JSON.parse(raw);
+      } catch (_) {
+        throw new Error(`本地推送接口未加载（HTTP ${response.status}），请重新启动仪表盘`);
+      }
+      if (!response.ok || result.error) throw new Error(result.error || `HTTP ${response.status}`);
+      return result;
+    }
+
+    async function loadPushStatus() {
+      try {
+        const response = await fetch('/api/push/status', {cache: 'no-store'});
+        const result = await response.json();
+        if (!response.ok || result.error) throw new Error(result.error || `HTTP ${response.status}`);
+        state.push = result;
+        document.getElementById('push-enabled').checked = Boolean(result.enabled);
+        document.getElementById('push-test').disabled = !result.configured;
+        pushStatusNode.textContent = result.configured
+          ? `${result.channel}已配置 · ${result.enabled ? '自动推送已开启' : '自动推送已关闭'} · ${result.last_result || '尚未发送'}`
+          : '尚未配置企业微信 Webhook。完整地址不会在保存后回显。';
+      } catch (error) {
+        pushStatusNode.textContent = `状态读取失败：${error.message || error}`;
+      }
+    }
+
+    async function savePushSettings(event) {
+      event.preventDefault();
+      const webhook = document.getElementById('push-webhook').value.trim();
+      const enabled = document.getElementById('push-enabled').checked;
+      pushStatusNode.textContent = '正在保存配置...';
+      try {
+        const result = await postJSON('/api/push/config', {webhook, enabled});
+        document.getElementById('push-webhook').value = '';
+        state.push = result;
+        await loadPushStatus();
+      } catch (error) {
+        pushStatusNode.textContent = `保存失败：${error.message || error}`;
+      }
+    }
+
+    async function sendTestPush() {
+      const button = document.getElementById('push-test');
+      button.disabled = true;
+      pushStatusNode.textContent = '正在发送测试消息...';
+      try {
+        await postJSON('/api/push/test', {});
+        await loadPushStatus();
+      } catch (error) {
+        pushStatusNode.textContent = `测试失败：${error.message || error}`;
+      } finally {
+        button.disabled = !state.push?.configured;
+      }
+    }
+
+    function renderError(message) {
+      phaseNode.textContent = '行情不可用';
+      updatedNode.textContent = '';
+      content.className = 'loading';
+      content.innerHTML = `<div class="error-box"><strong>暂时无法生成当日建议</strong><div>${esc(message)}</div></div>`;
+    }
+
+    function render() {
+      const data = state.data;
+      phaseNode.textContent = data.phase_label;
+      updatedNode.textContent = `生成 ${new Date(data.generated_at).toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit', second:'2-digit'})}`;
+      content.className = '';
+      content.innerHTML = `
+        ${renderDecision(data)}
+        ${renderMetrics(data)}
+        <nav class="tabs" role="tablist" aria-label="行情视图">
+          <button class="tab" type="button" role="tab" data-view="today" aria-selected="${state.activeView === 'today'}">今日建议</button>
+          <button class="tab" type="button" role="tab" data-view="universe" aria-selected="${state.activeView === 'universe'}">全部自选</button>
+        </nav>
+        <div class="view" id="today-view" ${state.activeView === 'today' ? '' : 'hidden'}>
+          ${renderToday(data)}
+        </div>
+        <div class="view" id="universe-view" ${state.activeView === 'universe' ? '' : 'hidden'}>
+          ${renderUniverse(data)}
+        </div>
+        ${renderSources(data)}
+        <footer class="footer">${esc(data.disclaimer)}</footer>`;
+      wireTabs();
+      requestAnimationFrame(drawAllCharts);
+    }
+
+    function renderDecision(data) {
+      const position = Math.max(0, Math.min(100, Number(data.position_pct) || 0));
+      return `<section class="decision ${esc(data.decision)}">
+        <div>
+          <p class="eyebrow">基于 ${esc(data.data_as_of)} 可见数据</p>
+          <h2 class="headline">${esc(data.headline)}</h2>
+          <p class="decision-copy">${esc(data.summary)}</p>
+        </div>
+        <svg class="position-ring" viewBox="0 0 120 120" role="img" aria-label="计划仓位 ${num(position, 0)}%">
+          <circle class="ring-track" cx="60" cy="60" r="48"></circle>
+          <circle class="ring-progress ${position > 0 ? '' : 'empty-ring'}" cx="60" cy="60" r="48" pathLength="100" stroke-dasharray="${position} ${100 - position}" transform="rotate(-90 60 60)"></circle>
+          <text class="ring-number" x="60" y="59">${num(position, 0)}%</text>
+          <text class="ring-label" x="60" y="77">计划仓位</text>
+        </svg>
+      </section>`;
+    }
+
+    function renderMetrics(data) {
+      const executable = data.candidates.filter((stock) => stock.action === '条件式买入').length;
+      return `<section class="metric-strip">
+        <div class="metric"><span class="metric-label">市场开仓状态</span><span class="metric-value ${esc(data.market.state)}">${esc(data.market.label)}</span><span class="metric-note">${esc(data.market.summary)}</span></div>
+        <div class="metric"><span class="metric-label">可执行标的</span><span class="metric-value">${executable} 只</span><span class="metric-note">${executable ? `本金池 ${money(data.capital)}` : '没有满足全部硬门槛的买点'}</span></div>
+        <div class="metric"><span class="metric-label">行情截点</span><span class="metric-value">${esc(data.data_as_of.slice(11))}</span><span class="metric-note">${esc(data.data_as_of.slice(0, 10))}</span></div>
+        <div class="metric"><span class="metric-label">自选池覆盖</span><span class="metric-value">${data.universe.length} / 43</span><span class="metric-note">${esc(data.methodology)}</span></div>
+      </section>`;
+    }
+
+    function renderToday(data) {
+      const hasExecution = data.decision === 'buy' && data.position_pct > 0 && data.candidates.some((stock) => stock.action === '条件式买入');
+      return `
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">市场结构</h2><span class="section-note">涨跌颜色按 A 股习惯：红涨绿跌</span></div>
+          ${renderMarketBoard(data.indices)}
+        </section>
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">交易门槛</h2><span class="section-note">市场、时点、个股、仓位依次约束</span></div>
+          ${renderGateFlow(data)}
+          ${data.errors.length ? `<details class="diagnostics"><summary>数据缺口 ${data.errors.length} 项</summary><pre>${esc(data.errors.join('\n'))}</pre></details>` : ''}
+        </section>
+        ${hasExecution ? `<section class="section">
+          <div class="section-head"><h2 class="section-title">候选与执行</h2><span class="section-note">仅展示当前可执行方案</span></div>
+          <div id="candidate-list">${data.candidates.map(renderCandidate).join('')}</div>
+        </section>` : ''}`;
+    }
+
+    function renderMarketBoard(indices) {
+      return `<div class="market-board" role="img" aria-label="四个主要指数涨跌对比，中央线为零涨跌">
+        ${indices.map((index) => {
+          const change = Number(index.change_pct) || 0;
+          const direction = change > 0 ? 'positive' : change < 0 ? 'negative' : 'flat';
+          const width = change === 0 ? 2 : Math.min(48, Math.max(2, Math.abs(change) / 7 * 48));
+          return `<div class="index-row">
+            <span class="index-name">${esc(index.name)}</span>
+            <span class="index-value">${num(index.price)}</span>
+            <span class="index-track" aria-hidden="true"><span class="index-zero"></span><span class="index-bar ${direction}" style="width:${width.toFixed(1)}%"></span></span>
+            <span class="index-change ${tone(change)}">${pct(change)}</span>
+          </div>`;
+        }).join('')}
+      </div>`;
+    }
+
+    function renderGateFlow(data) {
+      const eligible = data.universe.filter((stock) => stock.eligible).length;
+      const phaseTone = data.phase === 'decision' ? 'green' : data.phase === 'observe' ? 'yellow' : 'red';
+      const stockTone = eligible > 0 ? 'green' : 'red';
+      const executionTone = data.position_pct > 0 ? 'green' : 'red';
+      return `<div class="gate-flow">
+        <div class="gate-step ${esc(data.market.state)}"><span class="gate-marker"></span><span class="gate-label">1 · 市场门槛</span><span class="gate-value">${esc(data.market.label)}</span></div>
+        <div class="gate-step ${phaseTone}"><span class="gate-marker"></span><span class="gate-label">2 · 决策时点</span><span class="gate-value">${esc(data.phase_label)}</span></div>
+        <div class="gate-step ${stockTone}"><span class="gate-marker"></span><span class="gate-label">3 · 个股硬门槛</span><span class="gate-value">${eligible} 只通过</span></div>
+        <div class="gate-step ${executionTone}"><span class="gate-marker"></span><span class="gate-label">4 · 最终执行</span><span class="gate-value">${num(data.position_pct, 0)}% 仓位</span></div>
+      </div>`;
+    }
+
+    function renderCandidate(stock, index) {
+      const isBuy = stock.action === '条件式买入';
+      const announcements = stock.announcements || {};
+      const noticeRows = Array.isArray(announcements.recent) && announcements.recent.length
+        ? announcements.recent.map((notice) => `<div class="announcement-row">${esc(notice.date)} · <a href="${esc(notice.url)}" target="_blank" rel="noreferrer">${esc(notice.title)}</a></div>`).join('')
+        : `<div class="announcement-row">${announcements.verified ? '近10日未返回公告' : '公告自动核验未完成'}</div>`;
+      return `<article class="candidate">
+        <header class="candidate-header">
+          <div><h3 class="stock-name">${esc(stock.name)}<span class="stock-code">${esc(stock.code)}</span></h3><div class="stock-sub">评分 ${num(stock.score, 1)} · 行情 ${esc(stock.last_time)} · 前复权</div></div>
+          <div class="candidate-action"><span class="action-text ${isBuy ? 'red' : 'yellow'}">${esc(stock.action)}</span><span class="action-position">计划仓位 ${num(stock.position_pct, 0)}%</span></div>
+        </header>
+        <div class="candidate-stats">
+          <div class="candidate-stat"><span class="stat-label">价格 / 涨跌</span><span class="stat-value">${num(stock.price, 3)} <span class="${tone(stock.change_pct)}">${pct(stock.change_pct)}</span></span></div>
+          <div class="candidate-stat"><span class="stat-label">计划区间</span><span class="stat-value">${esc(stock.entry_range)}</span></div>
+          <div class="candidate-stat"><span class="stat-label">结构失效</span><span class="stat-value">${num(stock.invalidation, 3)}</span></div>
+          <div class="candidate-stat"><span class="stat-label">上方阻力 / 赔率</span><span class="stat-value">${num(stock.resistance, 3)} / ${num(stock.reward_risk)}R</span></div>
+          <div class="candidate-stat"><span class="stat-label">股数 / 占用资金</span><span class="stat-value">${num(stock.shares, 0)} / ${money(stock.capital_used)}</span></div>
+        </div>
+        <div class="candidate-grid">
+          <div class="candidate-panel"><h4 class="panel-title">14:30 条件</h4><dl class="facts">
+            <dt>入场触发</dt><dd>${isBuy ? `价格保持在 ${num(stock.vwap, 3)} 分时均价上方且市场灯号不降级` : '当前未通过全部硬门槛'}</dd>
+            <dt>禁止追高</dt><dd>${isBuy ? `高于 ${num(stock.no_chase, 3)} 取消` : '不建立新仓'}</dd>
+            <dt>相对强弱</dt><dd>1日 ${pct(stock.rs1)} · 3日 ${pct(stock.rs3)} · 5日 ${pct(stock.rs5)}</dd>
+            <dt>尾盘结构</dt><dd>近30分钟 ${pct(stock.tail_return_pct)} · 回撤 ${pct(stock.tail_pullback_pct)}</dd>
+            <dt>名义风险</dt><dd>${money(stock.planned_loss)}，隔夜跳空可能超过该值</dd>
+          </dl></div>
+          <div class="candidate-panel"><h4 class="panel-title">技术确认</h4><dl class="facts">
+            <dt>K线趋势</dt><dd>${esc(stock.trend)}</dd>
+            <dt>均线</dt><dd>MA5 ${num(stock.ma5, 3)} · MA10 ${num(stock.ma10, 3)} · MA20 ${num(stock.ma20, 3)}</dd>
+            <dt>MACD</dt><dd>${esc(stock.macd)} · DIF ${num(stock.dif, 4)} · DEA ${num(stock.dea, 4)}</dd>
+            <dt>量能节奏</dt><dd>${num(stock.volume_pace)} 倍同期速度</dd>
+            <dt>分时均价</dt><dd>${num(stock.vwap, 3)}</dd>
+          </dl></div>
+        </div>
+        <div class="risk-area">
+          <div><h4 class="panel-title">未通过门槛</h4><ul class="compact-list">${list(stock.failures, '已通过当前自动硬门槛')}</ul></div>
+          <div><h4 class="panel-title">反方风险</h4><ul class="compact-list">${list(stock.warnings, '隔夜跳空与流动性风险')}</ul></div>
+        </div>
+        <div class="timeline">${stock.exit_plan.map((step) => `<div class="timeline-step"><span class="timeline-time">${esc(step.time)}</span><div class="timeline-action">${esc(step.action)}</div></div>`).join('')}</div>
+        <div class="announcement"><h4 class="panel-title">近期公告自动筛查</h4>${noticeRows}</div>
+        ${Array.isArray(stock.chart) && stock.chart.length >= 20 ? `<div class="charts"><div class="chart-head"><span class="chart-label">近45日 K 线与 MACD</span><div class="legend"><span class="legend-key ma5">MA5</span><span class="legend-key ma10">MA10</span><span class="legend-key ma20">MA20</span></div></div><div class="price-chart"><canvas data-chart="price" data-index="${index}" aria-label="${esc(stock.name)}K线图"></canvas></div><div class="macd-chart"><canvas data-chart="macd" data-index="${index}" aria-label="${esc(stock.name)}MACD图"></canvas></div></div>` : ''}
+      </article>`;
+    }
+
+    function renderUniverse(data) {
+      const up = data.universe.filter((stock) => Number(stock.change_pct) > 0).length;
+      const down = data.universe.filter((stock) => Number(stock.change_pct) < 0).length;
+      const flat = Math.max(0, data.universe.length - up - down);
+      const total = Math.max(1, data.universe.length);
+      return `<section class="section">
+        <div class="section-head"><h2 class="section-title">自选池全览</h2><span class="section-note">按综合观察分排序</span></div>
+        <div class="breadth">
+          <div class="breadth-labels"><span>上涨 <strong class="red">${up}</strong></span><span>下跌 <strong class="green">${down}</strong></span><span>平盘 <strong>${flat}</strong></span></div>
+          <div class="breadth-track" role="img" aria-label="自选池上涨 ${up} 只，下跌 ${down} 只，平盘 ${flat} 只"><span class="breadth-up" style="width:${up / total * 100}%"></span><span class="breadth-flat" style="width:${flat / total * 100}%"></span><span class="breadth-down" style="width:${down / total * 100}%"></span></div>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>代码 / 名称</th><th>现价</th><th>涨跌</th><th>观察分</th><th>趋势</th><th>MACD</th><th>赔率</th><th>首要排除原因</th></tr></thead><tbody>
+          ${data.universe.map((stock) => `<tr><td><strong>${esc(stock.name)}</strong><br><span class="stock-code">${esc(stock.code)}</span></td><td>${num(stock.price, 3)}</td><td class="${tone(stock.change_pct)}">${pct(stock.change_pct)}</td><td class="score">${num(stock.score, 1)}<div class="score-track" aria-hidden="true"><span class="score-fill" style="width:${Math.max(0, Math.min(100, Number(stock.score) || 0))}%"></span></div></td><td>${esc(stock.trend)}</td><td>${esc(stock.macd)}</td><td>${num(stock.reward_risk)}R</td><td class="fail-text">${esc(stock.failures?.[0] || '进入候选核验')}</td></tr>`).join('')}
+        </tbody></table></div>
+      </section>`;
+    }
+
+    function renderSources(data) {
+      return `<section class="section"><div class="section-head"><h2 class="section-title">数据与口径</h2><span class="section-note">自动刷新间隔 60 秒</span></div><div class="source-grid">${data.sources.map((source) => `<div class="source">${sourceLink(source)}<br>${esc(source.as_of)}</div>`).join('')}</div></section>`;
+    }
+
+    function wireTabs() {
+      const tabs = Array.from(document.querySelectorAll('.tab'));
+      tabs.forEach((tab) => tab.addEventListener('click', () => {
+        state.activeView = tab.dataset.view;
+        tabs.forEach((item) => item.setAttribute('aria-selected', String(item === tab)));
+        document.getElementById('today-view').hidden = state.activeView !== 'today';
+        document.getElementById('universe-view').hidden = state.activeView !== 'universe';
+        if (state.activeView === 'today') requestAnimationFrame(drawAllCharts);
+      }));
+    }
+
+    function numeric(value) { const output = Number(value); return Number.isFinite(output) ? output : null; }
+
+    function canvasContext(canvas) {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      const context = canvas.getContext('2d');
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return {context, width: rect.width, height: rect.height};
+    }
+
+    function drawLine(context, bars, key, xAt, yAt, color) {
+      context.beginPath();
+      let started = false;
+      bars.forEach((bar, index) => {
+        const point = numeric(bar[key]);
+        if (point === null) return;
+        if (!started) { context.moveTo(xAt(index), yAt(point)); started = true; }
+        else context.lineTo(xAt(index), yAt(point));
+      });
+      context.strokeStyle = color;
+      context.lineWidth = 1.4;
+      context.stroke();
+    }
+
+    function drawPrice(canvas, bars) {
+      const {context, width, height} = canvasContext(canvas);
+      const margin = {left: 47, right: 12, top: 12, bottom: 24};
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      const values = bars.flatMap((bar) => ['low','high','ma5','ma10','ma20'].map((key) => numeric(bar[key])).filter((item) => item !== null));
+      if (!values.length || plotWidth <= 0 || plotHeight <= 0) return;
+      let minimum = Math.min(...values), maximum = Math.max(...values);
+      const padding = Math.max((maximum - minimum) * .08, maximum * .005);
+      minimum -= padding; maximum += padding;
+      const xAt = (index) => margin.left + plotWidth * (index + .5) / bars.length;
+      const yAt = (price) => margin.top + (maximum - price) / (maximum - minimum) * plotHeight;
+      context.font = '11px -apple-system, sans-serif';
+      context.fillStyle = '#68747a';
+      context.strokeStyle = '#e1e5e7';
+      for (let row = 0; row <= 4; row += 1) {
+        const y = margin.top + plotHeight * row / 4;
+        context.beginPath(); context.moveTo(margin.left, y); context.lineTo(width - margin.right, y); context.stroke();
+        context.fillText((maximum - (maximum - minimum) * row / 4).toFixed(2), 2, y + 4);
+      }
+      const candleWidth = Math.max(2, Math.min(9, plotWidth / bars.length * .58));
+      bars.forEach((bar, index) => {
+        const open = numeric(bar.open), high = numeric(bar.high), low = numeric(bar.low), close = numeric(bar.close);
+        if ([open, high, low, close].some((item) => item === null)) return;
+        const color = close >= open ? '#bd332d' : '#177044';
+        const x = xAt(index);
+        context.strokeStyle = color; context.fillStyle = color;
+        context.beginPath(); context.moveTo(x, yAt(high)); context.lineTo(x, yAt(low)); context.stroke();
+        const top = Math.min(yAt(open), yAt(close));
+        context.fillRect(x - candleWidth / 2, top, candleWidth, Math.max(1.5, Math.abs(yAt(open) - yAt(close))));
+      });
+      const styles = getComputedStyle(document.documentElement);
+      drawLine(context, bars, 'ma5', xAt, yAt, styles.getPropertyValue('--blue'));
+      drawLine(context, bars, 'ma10', xAt, yAt, styles.getPropertyValue('--orange'));
+      drawLine(context, bars, 'ma20', xAt, yAt, styles.getPropertyValue('--violet'));
+      context.fillStyle = '#68747a';
+      const firstDate = String(bars[0].date || '').slice(5);
+      const lastDate = String(bars[bars.length - 1].date || '').slice(5);
+      context.fillText(firstDate, margin.left, height - 5);
+      context.fillText(lastDate, Math.max(margin.left, width - margin.right - context.measureText(lastDate).width), height - 5);
+    }
+
+    function drawMacd(canvas, bars) {
+      const {context, width, height} = canvasContext(canvas);
+      const margin = {left: 47, right: 12, top: 10, bottom: 18};
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      const values = bars.flatMap((bar) => ['dif','dea','histogram'].map((key) => numeric(bar[key])).filter((item) => item !== null));
+      if (!values.length || plotWidth <= 0 || plotHeight <= 0) return;
+      const extent = Math.max(Math.abs(Math.min(...values)), Math.abs(Math.max(...values)), .0001) * 1.12;
+      const xAt = (index) => margin.left + plotWidth * (index + .5) / bars.length;
+      const yAt = (point) => margin.top + (extent - point) / (extent * 2) * plotHeight;
+      context.strokeStyle = '#d9dee1';
+      context.beginPath(); context.moveTo(margin.left, yAt(0)); context.lineTo(width - margin.right, yAt(0)); context.stroke();
+      const barWidth = Math.max(2, Math.min(8, plotWidth / bars.length * .55));
+      bars.forEach((bar, index) => {
+        const histogram = numeric(bar.histogram);
+        if (histogram === null) return;
+        context.fillStyle = histogram >= 0 ? '#bd332d' : '#177044';
+        const top = Math.min(yAt(histogram), yAt(0));
+        context.fillRect(xAt(index) - barWidth / 2, top, barWidth, Math.max(1, Math.abs(yAt(histogram) - yAt(0))));
+      });
+      drawLine(context, bars, 'dif', xAt, yAt, '#23699d');
+      drawLine(context, bars, 'dea', xAt, yAt, '#bb741b');
+      context.fillStyle = '#68747a'; context.font = '11px -apple-system, sans-serif'; context.fillText('MACD', 2, 15);
+    }
+
+    function drawAllCharts() {
+      if (!state.data || state.activeView !== 'today') return;
+      document.querySelectorAll('canvas[data-chart="price"]').forEach((canvas) => {
+        const stock = state.data.candidates[Number(canvas.dataset.index)];
+        if (stock) drawPrice(canvas, stock.chart || []);
+      });
+      document.querySelectorAll('canvas[data-chart="macd"]').forEach((canvas) => {
+        const stock = state.data.candidates[Number(canvas.dataset.index)];
+        if (stock) drawMacd(canvas, stock.chart || []);
+      });
+    }
+
+    refreshButton.addEventListener('click', () => loadData(true));
+    document.getElementById('push-settings').addEventListener('click', () => { loadPushStatus(); pushDialog.showModal(); });
+    document.getElementById('push-close').addEventListener('click', () => pushDialog.close());
+    document.getElementById('push-form').addEventListener('submit', savePushSettings);
+    document.getElementById('push-test').addEventListener('click', sendTestPush);
+    pushDialog.addEventListener('click', (event) => { if (event.target === pushDialog) pushDialog.close(); });
+    let resizeTimer;
+    window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawAllCharts, 130); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) loadData(false); });
+    state.timer = setInterval(() => { if (!document.hidden) loadData(false); }, 60_000);
+    loadData(false);
+  </script>
+</body>
+</html>
