@@ -1,0 +1,45 @@
+name: Daily A-share push
+
+on:
+  schedule:
+    # GitHub cron uses UTC. 06:31 UTC is 14:31 Asia/Shanghai.
+    - cron: "31 6 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-a-share-push
+  cancel-in-progress: false
+
+jobs:
+  analyze-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Shanghai
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: python -B -m unittest discover -s tests -v
+
+      - name: Analyze and push
+        run: python -B server.py --push-once
+
+      - name: Preserve decision snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decision-${{ github.run_id }}
+          path: data/decisions/*.json
+          if-no-files-found: ignore
+          retention-days: 30
