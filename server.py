@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Local live dashboard for a conservative A-share overnight screen."""
+"""A-share short-term dashboard and scheduled WeCom trading assistant."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -26,6 +27,7 @@ DATA_DIR = ROOT / "data"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 CAPITAL = 50_000
 CACHE_SECONDS = 55
+MAX_HOLDING_SESSIONS = 3
 
 WATCHLIST = [
     "300740", "000909", "002080", "300007", "002318", "300398", "300847",
@@ -53,8 +55,37 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {"expires": 0.0, "data": None}
 _push_lock = threading.Lock()
+_state_lock = threading.Lock()
 _scheduler_stop = threading.Event()
 PUSH_CONFIG_PATH = DATA_DIR / "wecom-push.json"
+TRADING_STATE_PATH = DATA_DIR / "trading-state.json"
+
+SCHEDULED_STAGES = {
+    "morning-summary": {
+        "cutoff": 10 * 60,
+        "push_time": 10 * 60,
+        "label": "10:00 早盘概况",
+        "entry": False,
+    },
+    "morning-decision": {
+        "cutoff": 10 * 60 + 30,
+        "push_time": 10 * 60 + 30,
+        "label": "10:30 持仓与交易决策",
+        "entry": True,
+    },
+    "tail-decision": {
+        "cutoff": 14 * 60 + 30,
+        "push_time": 14 * 60 + 30,
+        "label": "14:30 尾盘交易决策",
+        "entry": True,
+    },
+    "close-summary": {
+        "cutoff": 15 * 60,
+        "push_time": 15 * 60 + 30,
+        "label": "15:30 收盘总结",
+        "entry": False,
+    },
+}
 
 
 def symbol_for(code: str) -> str:
@@ -63,6 +94,10 @@ def symbol_for(code: str) -> str:
     if code.startswith(("4", "8", "9")):
         return f"bj{code}"
     return f"sz{code}"
+
+
+def lot_size_for(code: str) -> int:
+    return 200 if code.startswith("688") else 100
 
 
 def as_number(value: Any, default: float | None = None) -> float | None:
@@ -115,7 +150,7 @@ def load_push_config(include_secret: bool = False) -> dict[str, Any]:
         "enabled": bool(config.get("enabled")),
         "last_sent": str(config.get("last_sent", "")),
         "last_result": str(config.get("last_result", "")),
-        "schedule": "交易日 14:31",
+        "schedule": "交易日 10:00 / 10:30 / 14:30 / 15:30",
         "channel": "企业微信群机器人",
     }
     if include_secret:
@@ -151,6 +186,49 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
     return load_push_config()
 
 
+def empty_trading_state() -> dict[str, Any]:
+    return {"version": 1, "updated_at": "", "holdings": [], "history": [], "processed_events": []}
+
+
+def load_trading_state(path: Path | None = None) -> dict[str, Any]:
+    path = path or TRADING_STATE_PATH
+    with _state_lock:
+        if not path.exists():
+            return empty_trading_state()
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"交易状态文件无法读取：{error}") from error
+    if not isinstance(state, dict):
+        raise RuntimeError("交易状态文件格式无效")
+    normalized = empty_trading_state()
+    normalized.update(state)
+    for key in ("holdings", "history", "processed_events"):
+        if not isinstance(normalized.get(key), list):
+            raise RuntimeError(f"交易状态字段 {key} 格式无效")
+    normalized["holdings"] = [
+        item for item in normalized["holdings"]
+        if isinstance(item, dict) and item.get("status", "open") == "open"
+    ]
+    return normalized
+
+
+def save_trading_state(state: dict[str, Any], path: Path | None = None) -> None:
+    path = path or TRADING_STATE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with _state_lock:
+        temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+
+def percent_text(value: Any) -> str:
+    number = as_number(value)
+    if number is None:
+        return "无法计算"
+    return f"{number:+.2f}%"
+
+
 def format_wecom_message(analysis: dict[str, Any], test: bool = False) -> str:
     prefix = "测试 · " if test else ""
     lines = [
@@ -174,22 +252,103 @@ def format_wecom_message(analysis: dict[str, Any], test: bool = False) -> str:
             "",
         ])
     lines.extend([
-        "次日计划：09:25观察集合竞价，09:30-09:45执行，最迟10:00清仓可成交数量。",
+        "持有计划：下一交易日10:30复核；无卖点可继续持有，第3个可卖交易日必须退出。",
         "仅供研究参考，不构成个性化投资建议。",
     ])
     return "\n".join(lines)[:3800]
 
 
+def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
+    analysis = report["analysis"]
+    prefix = "测试 · " if test else ""
+    lines = [
+        f"**{prefix}{analysis.get('trade_date', '')} {report.get('label', 'A股短线助手')}**",
+        f">市场：{analysis.get('market', {}).get('label', '未核验')} · {analysis.get('market', {}).get('summary', '')}",
+        f">数据：{analysis.get('data_as_of', '未核验')}",
+        "",
+    ]
+    stage = report.get("stage")
+    if stage in ("morning-summary", "close-summary"):
+        lines.append("**主要指数**")
+        for index in analysis.get("indices", []):
+            lines.append(
+                f">{index.get('name', '')} {index.get('price', '未核验')} · {percent_text(index.get('change_pct'))}"
+            )
+        breadth = analysis.get("breadth", {})
+        lines.extend([
+            "",
+            f"自选池：上涨 {breadth.get('up', 0)} · 下跌 {breadth.get('down', 0)} · 平盘 {breadth.get('flat', 0)}",
+            f"平均涨跌：{percent_text(breadth.get('average_change_pct'))}",
+        ])
+        if stage == "morning-summary":
+            lines.append("10:00 仅报告早盘情况，10:30 再给持仓和交易决定。")
+        else:
+            lines.append("收盘总结使用截至15:00的行情，本条不产生交易操作。")
+    else:
+        reviews = report.get("holding_reviews", [])
+        buys = report.get("buys", [])
+        for item in reviews:
+            holding = item["holding"]
+            current_price = item.get("current_price")
+            if item["decision"] == "sell":
+                lines.extend([
+                    f"**卖出 · {holding.get('name', '')} {holding.get('code', '')}**",
+                    f">动作：卖出全部 {holding.get('shares', 0)} 股",
+                    f">成本：{holding.get('buy_price', '未核验')} · 参考卖价：{current_price if current_price is not None else '未核验'}",
+                    f">本次收益率：{percent_text(item.get('return_pct'))}（按参考价估算，未计费用与滑点）",
+                    f">持有：第 {item.get('holding_session', 0)} / {MAX_HOLDING_SESSIONS} 个可卖交易日",
+                    f">原因：{'；'.join(item.get('reasons', []))}",
+                    "",
+                ])
+            else:
+                lines.extend([
+                    f"**持有 · {holding.get('name', '')} {holding.get('code', '')}**",
+                    f">动作：继续持有，本次不卖",
+                    f">成本：{holding.get('buy_price', '未核验')} · 现价：{current_price if current_price is not None else '未核验'}",
+                    f">当前浮动收益率：{percent_text(item.get('return_pct'))}（未计费用与滑点）",
+                    f">持有：第 {item.get('holding_session', 0)} / {MAX_HOLDING_SESSIONS} 个可卖交易日",
+                    f">依据：{'；'.join(item.get('reasons', []))}",
+                    "",
+                ])
+        for stock in buys:
+            lines.extend([
+                f"**买入 · {stock.get('name', '')} {stock.get('code', '')}**",
+                f">参考买价：{stock.get('price', '未核验')} · 区间：{stock.get('entry_range', '未核验')}",
+                f">数量：{stock.get('shares', 0)} 股 · 仓位：{stock.get('position_pct', 0)}% · 资金：{stock.get('capital_used', 0)} 元",
+                f">失效参考：{stock.get('invalidation', '未核验')} · 目标参考：{stock.get('resistance', '未核验')}",
+                ">安排：下一交易日10:30复核；无卖点继续持有，第3个可卖交易日强制退出。",
+                "",
+            ])
+        if not reviews and not buys:
+            lines.append("**本次没有买点和卖点，不操作。**")
+        elif reviews and not any(item["decision"] == "sell" for item in reviews) and not buys:
+            lines.append("本次没有卖点，也不新增买入。")
+        notes = report.get("notes", [])
+        for note in notes:
+            lines.append(f">{note}")
+        lines.extend([
+            "",
+            "企业微信机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
+        ])
+    lines.extend(["", "仅供研究参考，不构成个性化投资建议。"])
+    return "\n".join(lines)[:3800]
+
+
 def send_wecom_push(
-    analysis: dict[str, Any], test: bool = False, webhook: str | None = None,
+    payload: dict[str, Any], test: bool = False, webhook: str | None = None,
 ) -> dict[str, Any]:
     webhook = webhook or load_push_config(include_secret=True).get("webhook", "")
     if not webhook:
         raise RuntimeError("尚未配置企业微信 Webhook")
     webhook = validate_wecom_webhook(webhook)
+    message = (
+        format_scheduled_message(payload, test=test)
+        if payload.get("report_type") == "scheduled"
+        else format_wecom_message(payload, test=test)
+    )
     body = json.dumps({
         "msgtype": "markdown",
-        "markdown": {"content": format_wecom_message(analysis, test=test)},
+        "markdown": {"content": message},
     }, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         webhook,
@@ -515,7 +674,7 @@ def analyze_security(
     if minute["tail_return_pct"] < -0.7 or minute["tail_low_delta_pct"] < -0.6:
         failures.append("最近30分钟结构走弱")
     if minute["tail_pullback_pct"] < -1.2:
-        failures.append("尾盘冲高回落")
+        failures.append("最近30分钟冲高回落")
     if minute["spike_5m_pct"] > 2.0:
         failures.append("最近5分钟拉升过快")
     if upper_wick_ratio > 0.45 and (volume_pace or 0) > 1.2:
@@ -578,8 +737,10 @@ def determine_phase(now: datetime, trade_date: str) -> tuple[str, str]:
     if now.weekday() >= 5 or trade_date != today:
         return "closed", "休市或行情非当日"
     minutes = now.hour * 60 + now.minute
-    if 9 * 60 + 15 <= minutes < 10 * 60:
-        return "exit", "T+1 退出窗口"
+    if 9 * 60 + 15 <= minutes < 10 * 60 + 30:
+        return "morning-summary", "早盘观察，等待10:30决策"
+    if 10 * 60 + 30 <= minutes <= 11 * 60:
+        return "morning-decision", "10:30 持仓与交易决策窗口"
     if minutes < 9 * 60 + 15 or minutes > 15 * 60:
         return "closed", "非交易时段"
     if 14 * 60 + 30 <= minutes <= 15 * 60:
@@ -600,17 +761,31 @@ def market_state(index_rows: list[dict[str, Any]]) -> dict[str, Any]:
         summary = "主要宽基同步走弱，系统性风险不允许新开仓"
     elif average < 0 or max(changes) - min(changes) > 2.2 or negative_tail >= 2:
         state, label = "yellow", "黄灯"
-        summary = "指数分化或尾盘结构不稳，只允许小仓位条件式方案"
+        summary = "指数分化或最近30分钟结构不稳，只允许小仓位条件式方案"
     else:
         state, label = "green", "绿灯"
         summary = "宽基结构相对稳定，仍需通过全部个股硬门槛"
     return {"state": state, "label": label, "summary": summary, "average_change_pct": round(average, 2)}
 
 
-def run_analysis(now: datetime | None = None) -> dict[str, Any]:
+def run_analysis(
+    now: datetime | None = None,
+    cutoff_minutes: int | None = None,
+    stage: str | None = None,
+) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
+    if stage is not None and stage not in SCHEDULED_STAGES:
+        raise ValueError(f"未知定时阶段：{stage}")
     current_minutes = now.hour * 60 + now.minute
-    cutoff_minutes = min(max(current_minutes, 9 * 60 + 30), 14 * 60 + 30)
+    if cutoff_minutes is None:
+        if stage:
+            cutoff_minutes = SCHEDULED_STAGES[stage]["cutoff"]
+        elif 11 * 60 + 30 < current_minutes < 13 * 60:
+            cutoff_minutes = 11 * 60 + 30
+        else:
+            cutoff_minutes = min(max(current_minutes, 9 * 60 + 30), 15 * 60)
+    if not 9 * 60 + 30 <= cutoff_minutes <= 15 * 60:
+        raise ValueError("行情截点必须位于09:30-15:00")
     symbols = [symbol_for(code) for code in WATCHLIST]
     all_symbols = symbols + list(BENCHMARKS)
     minute_raw: dict[str, dict[str, Any]] = {}
@@ -633,6 +808,9 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
         raise RuntimeError("实时分时行情全部获取失败")
     trade_date = max(trade_dates)
     phase, phase_label = determine_phase(now, trade_date)
+    if stage:
+        phase = stage
+        phase_label = SCHEDULED_STAGES[stage]["label"]
     parsed_minutes: dict[str, dict[str, Any]] = {}
     for symbol, raw in minute_raw.items():
         if raw.get("trade_date") != trade_date:
@@ -643,6 +821,7 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
             errors.append(f"{symbol} minute parse: {error}")
     index_rows = []
     benchmark_returns: dict[str, dict[str, float]] = {}
+    trading_dates: set[str] = set()
     for symbol, name in BENCHMARKS.items():
         minute = parsed_minutes.get(symbol)
         history = history_raw.get(symbol)
@@ -650,11 +829,13 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
             continue
         try:
             bars = synthesize_bars(history, minute)
+            trading_dates.update(str(bar["date"]).replace("-", "") for bar in bars)
             closes = [float(bar["close"]) for bar in bars]
             row = {
                 "symbol": symbol, "name": name, "price": round(minute["price"], 2),
                 "change_pct": round(minute["change_pct"] or 0, 2),
                 "tail_return_pct": round(minute["tail_return_pct"], 2),
+                "last_time": minute["last_time"],
             }
             index_rows.append(row)
             benchmark_returns[symbol] = {
@@ -698,27 +879,42 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
         item["eligible"] = not item["failures"]
     securities.sort(key=lambda item: (item["eligible"], item["score"]), reverse=True)
     strict_candidates = [item for item in securities if not item["failures"]]
-    actionable = phase == "decision" and market["state"] != "red"
-    recommendations = strict_candidates[: (1 if market["state"] == "yellow" else 2)] if actionable else []
+    entry_phase = phase in ("decision", "morning-decision", "tail-decision")
+    actionable = entry_phase and market["state"] != "red"
+    max_recommendations = 1 if market["state"] == "yellow" else 2
+    total_limit = 30 if market["state"] == "yellow" else 60
+    affordable = [
+        item for item in strict_candidates
+        if item["price"] * lot_size_for(item["code"]) <= CAPITAL * total_limit / 100
+    ]
+    recommendations = affordable[:max_recommendations] if actionable else []
+    while recommendations:
+        per_budget = CAPITAL * total_limit / 100 / len(recommendations)
+        resized = [
+            item for item in recommendations
+            if item["price"] * lot_size_for(item["code"]) <= per_budget
+        ]
+        if not resized:
+            recommendations = recommendations[:1]
+            continue
+        if len(resized) == len(recommendations):
+            break
+        recommendations = resized
+    entry_time = "10:30" if phase == "morning-decision" else "14:30"
     if recommendations:
         decision = "buy"
         headline = f"{len(recommendations)} 个条件式买点"
-        summary = "仅在页面列出的14:30触发条件仍成立时执行；任一取消条件出现则保持现金。"
-        total_limit = 30 if market["state"] == "yellow" else 60
+        summary = f"仅在页面列出的{entry_time}触发条件仍成立时执行；任一取消条件出现则保持现金。"
         per_position = total_limit / len(recommendations)
-    elif phase == "observe":
+    elif phase in ("observe", "morning-summary"):
         decision, headline = "watch", "观察，不在当前时点买入"
-        summary = "排名仅用于缩小观察范围，等待14:30分时结构和公告门槛确认。"
+        summary = "排名仅用于缩小观察范围，等待固定决策时点确认。"
         per_position = 0
-    elif phase == "exit":
-        decision, headline = "cash", "新仓 0%，昨日仓位最迟10:00退出"
-        summary = "当前处于T+1退出窗口，不为隔夜策略建立新仓。"
-        per_position = 0
-    elif phase == "decision" and market["state"] == "red":
+    elif entry_phase and market["state"] == "red":
         decision, headline = "cash", "空仓，仓位 0%"
         summary = "市场红灯覆盖个股排名，今天不建立隔夜仓位。"
         per_position = 0
-    elif phase == "decision":
+    elif entry_phase:
         decision, headline = "cash", "空仓，仓位 0%"
         summary = "没有股票同时通过市场、技术、分时、2R与公告硬门槛。"
         per_position = 0
@@ -734,8 +930,10 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
         is_buy = item["code"] in recommendation_codes
         position_pct = per_position if is_buy else 0
         entry = item["price"]
-        shares = math.floor((CAPITAL * position_pct / 100) / entry / 100) * 100 if entry else 0
+        lot_size = lot_size_for(item["code"])
+        shares = math.floor((CAPITAL * position_pct / 100) / entry / lot_size) * lot_size if entry else 0
         item["action"] = "条件式买入" if is_buy else "观察，不买"
+        item["entry_time"] = entry_time
         item["position_pct"] = round(position_pct, 1)
         item["shares"] = shares
         item["capital_used"] = round(shares * entry, 2)
@@ -743,9 +941,9 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
         item["entry_range"] = f"{entry * 0.997:.2f}-{entry * 1.003:.2f}" if is_buy else "未触发"
         item["no_chase"] = round(entry * 1.008, 3)
         item["exit_plan"] = [
-            {"time": "09:25", "action": "按集合竞价判断高开、平开或低开情景"},
-            {"time": "09:30-09:45", "action": "弱于指数或无承接优先退出；高开按计划兑现"},
-            {"time": "10:00", "action": "清仓全部可成交数量"},
+            {"time": "T+1 10:30", "action": "出现失效、目标位或早盘走弱信号则卖出"},
+            {"time": "T+1 / T+2", "action": "没有卖点可继续持有，不因时间焦虑强行交易"},
+            {"time": "T+3 10:30", "action": "达到最长持有期，卖出全部可成交数量"},
         ]
         item.pop("minute_records", None)
     universe = []
@@ -753,11 +951,19 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
         universe.append({
             key: item.get(key) for key in (
                 "code", "name", "price", "change_pct", "score", "trend", "macd",
-                "reward_risk", "last_time", "failures", "eligible",
+                "reward_risk", "last_time", "failures", "eligible", "vwap",
+                "tail_return_pct", "tail_pullback_pct", "invalidation", "resistance",
+                "ma5", "ma10", "ma20", "dif", "dea",
             )
         })
-    last_times = [item["last_time"] for item in parsed_minutes.values() if item.get("last_time")]
     data_as_of = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]} {minutes_to_hhmm(cutoff_minutes)}"
+    changes = [item["change_pct"] for item in universe if item.get("change_pct") is not None]
+    breadth = {
+        "up": sum(value > 0 for value in changes),
+        "down": sum(value < 0 for value in changes),
+        "flat": sum(value == 0 for value in changes),
+        "average_change_pct": round(fmean(changes), 2) if changes else None,
+    }
     response = {
         "generated_at": now.isoformat(timespec="seconds"),
         "data_as_of": data_as_of,
@@ -765,6 +971,12 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
         "phase": phase, "phase_label": phase_label,
         "decision": decision, "headline": headline, "summary": summary,
         "market": market, "indices": index_rows,
+        "market_data_time": min(
+            (row["last_time"] for row in index_rows if row.get("last_time")),
+            default="",
+        ),
+        "breadth": breadth,
+        "trading_dates": sorted(trading_dates),
         "capital": CAPITAL,
         "position_pct": round(sum(item["position_pct"] for item in display_candidates), 1),
         "candidates": display_candidates,
@@ -776,9 +988,9 @@ def run_analysis(now: datetime | None = None) -> dict[str, Any]:
             {"name": "东方财富公告", "url": "https://data.eastmoney.com/notices/", "as_of": now.strftime("%Y-%m-%d")},
         ],
         "disclaimer": "自动筛选仅供研究参考，不构成个性化投资建议。公告关键词筛查不等于完整公告研读；隔夜跳空、涨跌停和流动性可能使计划价格无法成交。",
-        "methodology": "14:30隔夜策略 v1",
+        "methodology": "1-3日短线策略 v2",
     }
-    if phase == "decision" and trade_date == now.strftime("%Y%m%d"):
+    if phase in ("decision", "tail-decision") and trade_date == now.strftime("%Y%m%d"):
         persist_decision(response, parsed_minutes)
     return response
 
@@ -798,7 +1010,14 @@ def persist_decision(response: dict[str, Any], minute_rows: dict[str, dict[str, 
     destination.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def get_analysis(force: bool = False) -> dict[str, Any]:
+def get_analysis(
+    force: bool = False,
+    now: datetime | None = None,
+    cutoff_minutes: int | None = None,
+    stage: str | None = None,
+) -> dict[str, Any]:
+    if now is not None or cutoff_minutes is not None or stage is not None:
+        return run_analysis(now=now, cutoff_minutes=cutoff_minutes, stage=stage)
     now_monotonic = time.monotonic()
     with _cache_lock:
         if not force and _cache["data"] is not None and now_monotonic < _cache["expires"]:
@@ -809,11 +1028,264 @@ def get_analysis(force: bool = False) -> dict[str, Any]:
         return data
 
 
-def push_once(webhook: str, now: datetime | None = None) -> dict[str, Any]:
-    """Run the 14:30 screen once for scheduled CI and push only a valid decision."""
+def stock_lookup(analysis: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(stock.get("code")): stock
+        for stock in analysis.get("universe", [])
+        if stock.get("code")
+    }
+
+
+def holding_session_number(holding: dict[str, Any], analysis: dict[str, Any]) -> int:
+    buy_date = str(holding.get("buy_date", "")).replace("-", "")
+    trade_date = str(analysis.get("trade_date", "")).replace("-", "")
+    trading_dates = {
+        str(value).replace("-", "") for value in analysis.get("trading_dates", [])
+    }
+    return sum(buy_date < value <= trade_date for value in trading_dates)
+
+
+def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    stocks = stock_lookup(analysis)
+    market = analysis.get("market", {})
+    reviews = []
+    for holding in state.get("holdings", []):
+        stock = stocks.get(str(holding.get("code")))
+        session_number = holding_session_number(holding, analysis)
+        if not stock or as_number(stock.get("price")) is None:
+            reviews.append({
+                "holding": copy.deepcopy(holding),
+                "decision": "hold",
+                "current_price": None,
+                "return_pct": None,
+                "holding_session": session_number,
+                "reasons": ["当前行情缺失，无法形成可执行卖点"],
+            })
+            continue
+        current = float(stock["price"])
+        buy_price = as_number(holding.get("buy_price"))
+        invalidation = as_number(holding.get("invalidation"))
+        target = as_number(holding.get("target_price"))
+        vwap = as_number(stock.get("vwap"))
+        return_pct = ((current / buy_price - 1) * 100) if buy_price else None
+        sell_reasons = []
+        if session_number >= MAX_HOLDING_SESSIONS:
+            sell_reasons.append(f"已到第{MAX_HOLDING_SESSIONS}个可卖交易日，达到最长持有期")
+        if invalidation is not None and current <= invalidation:
+            sell_reasons.append("价格跌至交易逻辑失效位")
+        if target is not None and current >= target:
+            sell_reasons.append("价格达到计划目标位")
+        if stock.get("trend") == "空头排列":
+            sell_reasons.append("日线均线转为空头排列")
+        early_weak = (
+            vwap is not None
+            and current < vwap * 0.995
+            and as_number(stock.get("tail_return_pct"), 0) < -0.4
+        )
+        if early_weak:
+            sell_reasons.append("10:00-10:30价格弱于分时均价且低点继续下移")
+        if (
+            market.get("state") == "red"
+            and as_number(stock.get("change_pct"), 0) < 0
+            and vwap is not None
+            and current < vwap
+        ):
+            sell_reasons.append("市场红灯且个股弱于分时均价")
+        if session_number <= 0:
+            decision = "hold"
+            reasons = ["当日买入受T+1限制，当前不可卖出"]
+        elif sell_reasons:
+            decision = "sell"
+            reasons = list(dict.fromkeys(sell_reasons))
+        else:
+            decision = "hold"
+            reasons = ["未触发失效位、目标位或早盘转弱卖点"]
+        reviews.append({
+            "holding": copy.deepcopy(holding),
+            "decision": decision,
+            "current_price": round(current, 3),
+            "return_pct": round(return_pct, 2) if return_pct is not None else None,
+            "holding_session": session_number,
+            "reasons": reasons,
+        })
+    return reviews
+
+
+def build_scheduled_report(
+    stage: str,
+    analysis: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    if stage not in SCHEDULED_STAGES:
+        raise ValueError(f"未知定时阶段：{stage}")
+    reviews = review_holdings(state, analysis) if stage == "morning-decision" else []
+    buys: list[dict[str, Any]] = []
+    notes: list[str] = []
+    open_holdings = state.get("holdings", [])
+    if stage == "morning-decision":
+        held_codes = {str(item.get("code")) for item in open_holdings}
+        has_continuing_position = any(item["decision"] != "sell" for item in reviews)
+        if has_continuing_position:
+            notes.append("已有持仓继续占用本金池，本时点不新增买入。")
+        else:
+            buys = [
+                copy.deepcopy(stock) for stock in analysis.get("candidates", [])
+                if str(stock.get("code")) not in held_codes
+                and int(as_number(stock.get("shares"), 0) or 0) > 0
+            ]
+    elif stage == "tail-decision":
+        if open_holdings:
+            notes.append("已有假定持仓，尾盘不重复占用5万元本金池。")
+        else:
+            buys = [
+                copy.deepcopy(stock) for stock in analysis.get("candidates", [])
+                if int(as_number(stock.get("shares"), 0) or 0) > 0
+            ]
+    report = {
+        "report_type": "scheduled",
+        "stage": stage,
+        "label": SCHEDULED_STAGES[stage]["label"],
+        "event_id": f"{analysis.get('trade_date', '')}:{stage}",
+        "analysis": analysis,
+        "holding_reviews": reviews,
+        "buys": buys,
+        "notes": notes,
+    }
+    report["trade_actions"] = (
+        sum(item["decision"] == "sell" for item in reviews) + len(buys)
+    )
+    return report
+
+
+def decorate_analysis_with_state(
+    analysis: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    payload = copy.deepcopy(analysis)
+    reviews = review_holdings(state, payload)
+    payload["assumed_holdings"] = [
+        {
+            **item["holding"],
+            "current_price": item.get("current_price"),
+            "return_pct": item.get("return_pct"),
+            "holding_session": item.get("holding_session", 0),
+            "review_decision": item.get("decision"),
+            "review_reasons": item.get("reasons", []),
+        }
+        for item in reviews
+    ]
+    payload["recent_trades"] = copy.deepcopy(state.get("history", [])[-10:])
+    stage = None
+    if payload.get("phase") == "morning-decision":
+        stage = "morning-decision"
+    elif payload.get("phase") == "decision":
+        stage = "tail-decision"
+    if not stage:
+        return payload
+    report = build_scheduled_report(stage, payload, state)
+    payload["holding_reviews"] = report["holding_reviews"]
+    payload["candidates"] = report["buys"]
+    payload["position_pct"] = round(
+        sum(as_number(item.get("position_pct"), 0) or 0 for item in report["buys"]), 1,
+    )
+    sells = sum(item["decision"] == "sell" for item in report["holding_reviews"])
+    holds = len(report["holding_reviews"]) - sells
+    if sells and report["buys"]:
+        payload["decision"] = "buy"
+        payload["headline"] = f"卖出 {sells} 只，并买入 {len(report['buys'])} 只"
+        payload["summary"] = "企业微信推送成功后，按参考价默认记录上述明确指令。"
+    elif sells:
+        payload["decision"] = "cash"
+        payload["headline"] = f"{sells} 个卖点，按计划退出"
+        payload["summary"] = "页面收益率按当前参考价估算，未计费用与滑点。"
+    elif holds:
+        payload["decision"] = "watch"
+        payload["headline"] = "继续持有，本次不卖"
+        payload["summary"] = "没有触发卖点；已有持仓时不重复占用本金池。"
+    elif not report["buys"]:
+        payload["decision"] = "cash"
+        payload["headline"] = "本次没有买点和卖点"
+        payload["summary"] = "不操作，保持当前现金和持仓状态。"
+    return payload
+
+
+def apply_scheduled_report(
+    state: dict[str, Any],
+    report: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    updated = copy.deepcopy(state)
+    sold_by_code = {
+        str(item["holding"].get("code")): item
+        for item in report.get("holding_reviews", [])
+        if item.get("decision") == "sell"
+    }
+    remaining = []
+    for holding in updated.get("holdings", []):
+        review = sold_by_code.get(str(holding.get("code")))
+        if not review:
+            remaining.append(holding)
+            continue
+        closed = copy.deepcopy(holding)
+        closed.update({
+            "status": "closed",
+            "sell_date": report["analysis"].get("trade_date", ""),
+            "sell_time": "1030",
+            "sell_price": review.get("current_price"),
+            "return_pct": review.get("return_pct"),
+            "sell_reason": "；".join(review.get("reasons", [])),
+        })
+        updated.setdefault("history", []).append(closed)
+    updated["holdings"] = remaining
+    existing_codes = {str(item.get("code")) for item in remaining}
+    stage = report["stage"]
+    buy_time = minutes_to_hhmm(SCHEDULED_STAGES[stage]["cutoff"]).replace(":", "")
+    trade_date = report["analysis"].get("trade_date", "")
+    for stock in report.get("buys", []):
+        code = str(stock.get("code", ""))
+        shares = int(as_number(stock.get("shares"), 0) or 0)
+        price = as_number(stock.get("price"))
+        if not code or code in existing_codes or shares <= 0 or price is None:
+            continue
+        updated["holdings"].append({
+            "id": f"{trade_date}-{buy_time}-{code}",
+            "code": code,
+            "name": stock.get("name", ""),
+            "buy_date": trade_date,
+            "buy_time": buy_time,
+            "buy_price": round(price, 3),
+            "shares": shares,
+            "capital_used": round(shares * price, 2),
+            "invalidation": stock.get("invalidation"),
+            "target_price": stock.get("resistance"),
+            "source": "morning" if stage == "morning-decision" else "tail",
+            "status": "open",
+        })
+        existing_codes.add(code)
+    processed = updated.setdefault("processed_events", [])
+    if report["event_id"] not in processed:
+        processed.append(report["event_id"])
+    updated["processed_events"] = processed[-120:]
+    updated["history"] = updated.get("history", [])[-200:]
+    updated["updated_at"] = now.isoformat(timespec="seconds")
+    updated["last_event"] = {
+        "id": report["event_id"],
+        "trade_actions": report.get("trade_actions", 0),
+    }
+    return updated
+
+
+def scheduled_push(
+    stage: str,
+    webhook: str,
+    now: datetime | None = None,
+    state_path: Path | None = None,
+) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
     webhook = validate_wecom_webhook(webhook)
-    analysis = get_analysis(force=True)
+    if stage not in SCHEDULED_STAGES:
+        raise ValueError(f"未知定时阶段：{stage}")
+    analysis = run_analysis(now=now, stage=stage)
     today = now.strftime("%Y%m%d")
     if analysis.get("trade_date") != today:
         return {
@@ -821,37 +1293,61 @@ def push_once(webhook: str, now: datetime | None = None) -> dict[str, Any]:
             "reason": "行情不是当日数据，可能休市",
             "trade_date": analysis.get("trade_date", ""),
         }
-    if analysis.get("phase") != "decision":
+    market_data_minutes = hhmm_to_minutes(str(analysis.get("market_data_time", "")))
+    required_minutes = int(SCHEDULED_STAGES[stage]["cutoff"])
+    if market_data_minutes < required_minutes:
         return {
             "sent": False,
-            "reason": "当前不在14:30-15:00决策窗口",
-            "phase": analysis.get("phase", ""),
+            "reason": "行情尚未更新到该阶段截点",
+            "market_data_time": analysis.get("market_data_time", ""),
+            "required_time": minutes_to_hhmm(required_minutes),
         }
-    send_wecom_push(analysis, webhook=webhook)
+    state = load_trading_state(state_path)
+    event_id = f"{today}:{stage}"
+    if event_id in state.get("processed_events", []):
+        return {
+            "sent": False,
+            "reason": "该阶段已经成功推送",
+            "event_id": event_id,
+        }
+    report = build_scheduled_report(stage, analysis, state)
+    send_wecom_push(report, webhook=webhook)
+    updated = apply_scheduled_report(state, report, now)
+    save_trading_state(updated, state_path)
     return {
         "sent": True,
         "trade_date": analysis.get("trade_date", ""),
-        "headline": analysis.get("headline", ""),
-        "position_pct": analysis.get("position_pct", 0),
+        "stage": stage,
+        "trade_actions": report["trade_actions"],
+        "open_holdings": len(updated.get("holdings", [])),
     }
+
+
+def push_once(webhook: str, now: datetime | None = None) -> dict[str, Any]:
+    """Backward-compatible alias for the 14:30 scheduled decision."""
+    return scheduled_push("tail-decision", webhook, now=now)
 
 
 def push_scheduler_loop() -> None:
     while not _scheduler_stop.wait(30):
         now = datetime.now(SHANGHAI)
         minutes = now.hour * 60 + now.minute
-        if now.weekday() >= 5 or not (14 * 60 + 31 <= minutes <= 14 * 60 + 50):
+        if now.weekday() >= 5:
+            continue
+        stage = next(
+            (name for name, config in SCHEDULED_STAGES.items() if config["push_time"] == minutes),
+            None,
+        )
+        if not stage:
             continue
         config = load_push_config(include_secret=True)
-        today = now.strftime("%Y%m%d")
-        if not config.get("enabled") or not config.get("webhook") or config.get("last_sent") == today:
+        event_id = f"{now:%Y%m%d}:{stage}"
+        if not config.get("enabled") or not config.get("webhook") or config.get("last_sent") == event_id:
             continue
         try:
-            analysis = get_analysis(force=True)
-            if analysis.get("trade_date") != today or analysis.get("phase") != "decision":
-                continue
-            send_wecom_push(analysis)
-            save_push_config({"last_sent": today, "last_result": f"{now:%Y-%m-%d %H:%M} 推送成功"})
+            result = scheduled_push(stage, config["webhook"], now=now)
+            status = "推送成功" if result.get("sent") else f"跳过：{result.get('reason', '无需推送')}"
+            save_push_config({"last_sent": event_id, "last_result": f"{now:%Y-%m-%d %H:%M} {status}"})
         except Exception as error:
             save_push_config({"last_result": f"{now:%Y-%m-%d %H:%M} 推送失败：{error}"})
 
@@ -871,7 +1367,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/analysis":
             query = urllib.parse.parse_qs(parsed.query)
             try:
-                self.send_json(get_analysis(force=query.get("refresh") == ["1"]))
+                analysis = get_analysis(force=query.get("refresh") == ["1"])
+                self.send_json(decorate_analysis_with_state(analysis, load_trading_state()))
             except Exception as error:
                 self.send_json({"error": str(error), "generated_at": datetime.now(SHANGHAI).isoformat()}, status=503)
             return
@@ -920,15 +1417,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--push-once", action="store_true", help="运行一次14:30筛选并推送，供定时任务使用")
+    parser.add_argument("--push-once", action="store_true", help="兼容旧命令：运行一次14:30决策推送")
+    parser.add_argument(
+        "--scheduled-push",
+        choices=tuple(SCHEDULED_STAGES),
+        help="运行指定阶段的定时分析与推送",
+    )
     args = parser.parse_args()
-    if args.push_once:
+    if args.push_once or args.scheduled_push:
         webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
         if not webhook:
             print(json.dumps({"sent": False, "error": "缺少 WECOM_WEBHOOK"}, ensure_ascii=False))
             return 2
         try:
-            result = push_once(webhook)
+            stage = args.scheduled_push or "tail-decision"
+            result = scheduled_push(stage, webhook)
             print(json.dumps(result, ensure_ascii=False))
             return 0
         except Exception as error:
