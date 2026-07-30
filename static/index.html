@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>隔夜雷达</title>
+  <title>A股短线雷达</title>
   <style>
     :root {
       --ink: #172024;
@@ -257,7 +257,7 @@
   <div class="app">
     <header class="topbar">
       <div class="brand-row">
-        <h1 class="brand">隔夜雷达</h1>
+        <h1 class="brand">A股短线雷达</h1>
         <span class="phase" id="phase">连接行情中</span>
       </div>
       <div class="top-actions">
@@ -281,7 +281,7 @@
           <span class="field-label">消息推送 Webhook</span>
           <input class="field-input" id="push-webhook" type="password" autocomplete="off" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
         </label>
-        <label class="toggle-row"><input id="push-enabled" type="checkbox">交易日 14:31 自动推送</label>
+        <label class="toggle-row"><input id="push-enabled" type="checkbox">交易日四时点自动推送</label>
         <div class="push-status" id="push-status">正在读取推送状态...</div>
       </div>
       <div class="dialog-actions">
@@ -305,7 +305,7 @@
     const num = (input, digits = 2) => Number.isFinite(Number(input)) ? Number(input).toLocaleString('zh-CN', {minimumFractionDigits: digits, maximumFractionDigits: digits}) : missing;
     const money = (input) => Number.isFinite(Number(input)) ? `¥${Number(input).toLocaleString('zh-CN', {maximumFractionDigits: 0})}` : missing;
     const tone = (input) => Number(input) > 0 ? 'red' : Number(input) < 0 ? 'green' : '';
-    const pct = (input) => `${Number(input) > 0 ? '+' : ''}${num(input)}%`;
+    const pct = (input) => input !== null && input !== '' && Number.isFinite(Number(input)) ? `${Number(input) > 0 ? '+' : ''}${num(input)}%` : missing;
     const sourceLink = (source) => /^https?:\/\//.test(String(source.url || '')) ? `<a href="${esc(source.url)}" target="_blank" rel="noreferrer">${esc(source.name)}</a>` : esc(source.name);
     const list = (items, fallback) => (Array.isArray(items) && items.length ? items : [fallback]).map((item) => `<li>${esc(item)}</li>`).join('');
 
@@ -451,6 +451,7 @@
     function renderToday(data) {
       const hasExecution = data.decision === 'buy' && data.position_pct > 0 && data.candidates.some((stock) => stock.action === '条件式买入');
       return `
+        ${renderPortfolio(data)}
         <section class="section">
           <div class="section-head"><h2 class="section-title">市场结构</h2><span class="section-note">涨跌颜色按 A 股习惯：红涨绿跌</span></div>
           ${renderMarketBoard(data.indices)}
@@ -464,6 +465,19 @@
           <div class="section-head"><h2 class="section-title">候选与执行</h2><span class="section-note">仅展示当前可执行方案</span></div>
           <div id="candidate-list">${data.candidates.map(renderCandidate).join('')}</div>
         </section>` : ''}`;
+    }
+
+    function renderPortfolio(data) {
+      const holdings = Array.isArray(data.assumed_holdings) ? data.assumed_holdings : [];
+      const trades = Array.isArray(data.recent_trades) ? data.recent_trades.slice().reverse() : [];
+      if (!holdings.length && !trades.length) return '';
+      const holdingTable = holdings.length ? `<div class="table-wrap"><table><thead><tr><th>假定持仓</th><th>成本 / 现价</th><th>浮动收益率</th><th>持有进度</th><th>当前安排</th></tr></thead><tbody>
+        ${holdings.map((item) => `<tr><td><strong>${esc(item.name)}</strong><br><span class="stock-code">${esc(item.code)} · ${num(item.shares, 0)}股</span></td><td>${num(item.buy_price, 3)} / ${num(item.current_price, 3)}</td><td class="${tone(item.return_pct)}"><strong>${pct(item.return_pct)}</strong></td><td>第 ${num(item.holding_session, 0)} / 3 个可卖交易日</td><td>${item.review_decision === 'sell' && data.phase === 'morning-decision' ? '<strong class="red">10:30 卖出</strong>' : '等待10:30复核'}</td></tr>`).join('')}
+      </tbody></table></div>` : `<div class="empty"><strong>当前没有假定持仓</strong><p>只有企业微信成功发出明确买入指令后，系统才会记录持仓。</p></div>`;
+      const historyTable = trades.length ? `<details class="diagnostics"><summary>最近卖出记录 ${trades.length} 笔</summary><div class="table-wrap"><table><thead><tr><th>证券</th><th>买入 / 卖出</th><th>收益率</th><th>卖出日期</th></tr></thead><tbody>
+        ${trades.map((item) => `<tr><td><strong>${esc(item.name)}</strong><br><span class="stock-code">${esc(item.code)}</span></td><td>${num(item.buy_price, 3)} / ${num(item.sell_price, 3)}</td><td class="${tone(item.return_pct)}"><strong>${pct(item.return_pct)}</strong></td><td>${esc(item.sell_date)}</td></tr>`).join('')}
+      </tbody></table></div></details>` : '';
+      return `<section class="section"><div class="section-head"><h2 class="section-title">假定持仓</h2><span class="section-note">收益率未计费用与滑点，最长持有3个可卖交易日</span></div>${holdingTable}${historyTable}</section>`;
     }
 
     function renderMarketBoard(indices) {
@@ -484,7 +498,7 @@
 
     function renderGateFlow(data) {
       const eligible = data.universe.filter((stock) => stock.eligible).length;
-      const phaseTone = data.phase === 'decision' ? 'green' : data.phase === 'observe' ? 'yellow' : 'red';
+      const phaseTone = ['decision', 'morning-decision'].includes(data.phase) ? 'green' : ['observe', 'morning-summary'].includes(data.phase) ? 'yellow' : 'red';
       const stockTone = eligible > 0 ? 'green' : 'red';
       const executionTone = data.position_pct > 0 ? 'green' : 'red';
       return `<div class="gate-flow">
@@ -497,6 +511,7 @@
 
     function renderCandidate(stock, index) {
       const isBuy = stock.action === '条件式买入';
+      const entryTime = stock.entry_time || (state.data?.phase === 'morning-decision' ? '10:30' : '14:30');
       const announcements = stock.announcements || {};
       const noticeRows = Array.isArray(announcements.recent) && announcements.recent.length
         ? announcements.recent.map((notice) => `<div class="announcement-row">${esc(notice.date)} · <a href="${esc(notice.url)}" target="_blank" rel="noreferrer">${esc(notice.title)}</a></div>`).join('')
@@ -514,11 +529,11 @@
           <div class="candidate-stat"><span class="stat-label">股数 / 占用资金</span><span class="stat-value">${num(stock.shares, 0)} / ${money(stock.capital_used)}</span></div>
         </div>
         <div class="candidate-grid">
-          <div class="candidate-panel"><h4 class="panel-title">14:30 条件</h4><dl class="facts">
+          <div class="candidate-panel"><h4 class="panel-title">${esc(entryTime)} 条件</h4><dl class="facts">
             <dt>入场触发</dt><dd>${isBuy ? `价格保持在 ${num(stock.vwap, 3)} 分时均价上方且市场灯号不降级` : '当前未通过全部硬门槛'}</dd>
             <dt>禁止追高</dt><dd>${isBuy ? `高于 ${num(stock.no_chase, 3)} 取消` : '不建立新仓'}</dd>
             <dt>相对强弱</dt><dd>1日 ${pct(stock.rs1)} · 3日 ${pct(stock.rs3)} · 5日 ${pct(stock.rs5)}</dd>
-            <dt>尾盘结构</dt><dd>近30分钟 ${pct(stock.tail_return_pct)} · 回撤 ${pct(stock.tail_pullback_pct)}</dd>
+            <dt>分时结构</dt><dd>近30分钟 ${pct(stock.tail_return_pct)} · 回撤 ${pct(stock.tail_pullback_pct)}</dd>
             <dt>名义风险</dt><dd>${money(stock.planned_loss)}，隔夜跳空可能超过该值</dd>
           </dl></div>
           <div class="candidate-panel"><h4 class="panel-title">技术确认</h4><dl class="facts">
