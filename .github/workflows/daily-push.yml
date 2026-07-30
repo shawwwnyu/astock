@@ -2,9 +2,23 @@ name: Daily A-share push
 
 on:
   schedule:
-    # GitHub cron uses UTC. 06:31 UTC is 14:31 Asia/Shanghai.
-    - cron: "31 6 * * 1-5"
+    # GitHub cron uses UTC; all business times below are Asia/Shanghai (UTC+8).
+    - cron: "0 2 * * 1-5"   # 10:00 early-market summary
+    - cron: "30 2 * * 1-5"  # 10:30 holding and trading decision
+    - cron: "30 6 * * 1-5"  # 14:30 tail-session decision
+    - cron: "30 7 * * 1-5"  # 15:30 close summary (data cutoff 15:00)
   workflow_dispatch:
+    inputs:
+      stage:
+        description: Push stage
+        required: true
+        default: tail-decision
+        type: choice
+        options:
+          - morning-summary
+          - morning-decision
+          - tail-decision
+          - close-summary
 
 permissions:
   contents: read
@@ -32,14 +46,44 @@ jobs:
       - name: Run tests
         run: python -B -m unittest discover -s tests -v
 
+      - name: Resolve scheduled stage
+        id: stage
+        env:
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          MANUAL_STAGE: ${{ inputs.stage }}
+        run: |
+          case "$EVENT_SCHEDULE" in
+            "0 2 * * 1-5") stage="morning-summary" ;;
+            "30 2 * * 1-5") stage="morning-decision" ;;
+            "30 6 * * 1-5") stage="tail-decision" ;;
+            "30 7 * * 1-5") stage="close-summary" ;;
+            *) stage="${MANUAL_STAGE:-tail-decision}" ;;
+          esac
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+
+      - name: Restore assumed trading state
+        uses: actions/cache/restore@v4
+        with:
+          path: data/trading-state.json
+          key: astock-state-${{ github.run_id }}
+          restore-keys: |
+            astock-state-
+
       - name: Analyze and push
-        run: python -B server.py --push-once
+        run: python -B server.py --scheduled-push "${{ steps.stage.outputs.stage }}"
+
+      - name: Save assumed trading state
+        if: always() && hashFiles('data/trading-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: data/trading-state.json
+          key: astock-state-${{ github.run_id }}
 
       - name: Preserve decision snapshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: decision-${{ github.run_id }}
+          name: trading-audit-${{ github.run_id }}
           path: data/decisions/*.json
           if-no-files-found: ignore
           retention-days: 30
