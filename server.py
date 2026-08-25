@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import json
+import hashlib
 import math
 import os
+import secrets
 import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +23,11 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from weekly_review import (
+    DEFAULT_PARAMETERS, STRATEGY_VERSION, archive_formal_event, archive_path_for,
+    build_formal_event, load_config as load_weekly_config, weekly_review,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,9 +37,11 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 CAPITAL = 50_000
 CACHE_SECONDS = 55
 MAX_HOLDING_SESSIONS = 3
+UNIVERSE_VERSION = "2026-08-25.1"
 
 WATCHLIST = [
     "300740", "000909", "002080", "300007", "002318", "300398", "300847",
+    "300790", "001232",
     "603023", "002938", "603322", "600707", "300413", "605488", "300757",
     "000901", "600258", "300545", "300220", "003016", "600426", "603131",
     "002346", "000555", "002230", "601138", "603181", "688037", "600809",
@@ -40,6 +51,7 @@ WATCHLIST = [
 ]
 
 BENCHMARKS = {
+    "sh000300": "沪深300",
     "sh000001": "上证指数",
     "sz399001": "深证成指",
     "sz399006": "创业板指",
@@ -187,7 +199,36 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
 
 
 def empty_trading_state() -> dict[str, Any]:
-    return {"version": 1, "updated_at": "", "holdings": [], "history": [], "processed_events": []}
+    return {
+        "version": 3,
+        "updated_at": "",
+        "holdings": [],
+        "history": [],
+        "processed_events": [],
+        "committed_deliveries": [],
+        "committed_delivery_tokens": {},
+        "pending_report": None,
+    }
+
+
+@contextmanager
+def trading_state_transaction(path: Path | None = None):
+    path = path or TRADING_STATE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as lock_file:
+            descriptor = -1
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield path
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def load_trading_state(path: Path | None = None) -> dict[str, Any]:
@@ -196,6 +237,7 @@ def load_trading_state(path: Path | None = None) -> dict[str, Any]:
         if not path.exists():
             return empty_trading_state()
         try:
+            os.chmod(path, 0o600)
             state = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"交易状态文件无法读取：{error}") from error
@@ -203,9 +245,26 @@ def load_trading_state(path: Path | None = None) -> dict[str, Any]:
         raise RuntimeError("交易状态文件格式无效")
     normalized = empty_trading_state()
     normalized.update(state)
-    for key in ("holdings", "history", "processed_events"):
+    for key in ("holdings", "history", "processed_events", "committed_deliveries"):
         if not isinstance(normalized.get(key), list):
             raise RuntimeError(f"交易状态字段 {key} 格式无效")
+    committed_tokens = normalized.get("committed_delivery_tokens")
+    if not isinstance(committed_tokens, dict):
+        raise RuntimeError("交易状态字段 committed_delivery_tokens 格式无效")
+    normalized["committed_delivery_tokens"] = {
+        str(token): str(event_id)
+        for token, event_id in committed_tokens.items()
+        if isinstance(token, str) and isinstance(event_id, str)
+    }
+    for delivery in normalized["committed_deliveries"]:
+        if not isinstance(delivery, dict):
+            continue
+        token = delivery.get("commit_token")
+        event_id = delivery.get("event_id")
+        if isinstance(token, str) and isinstance(event_id, str):
+            normalized["committed_delivery_tokens"].setdefault(token, event_id)
+    if normalized.get("pending_report") is not None and not isinstance(normalized["pending_report"], dict):
+        raise RuntimeError("交易状态字段 pending_report 格式无效")
     normalized["holdings"] = [
         item for item in normalized["holdings"]
         if isinstance(item, dict) and item.get("status", "open") == "open"
@@ -218,8 +277,25 @@ def save_trading_state(state: dict[str, Any], path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with _state_lock:
-        temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
+                descriptor = -1
+                json.dump(state, temporary_file, ensure_ascii=False, indent=2)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         temporary.replace(path)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as error:
+            raise RuntimeError(f"交易状态目录无法同步：{error}") from error
+        finally:
+            os.close(parent_descriptor)
 
 
 def percent_text(value: Any) -> str:
@@ -332,6 +408,16 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
         ])
     lines.extend(["", "仅供研究参考，不构成个性化投资建议。"])
     return "\n".join(lines)[:3800]
+
+
+def format_lightclaw_message(report: dict[str, Any], test: bool = False) -> str:
+    message = format_scheduled_message(report, test=False)
+    if test:
+        message = message.replace("**", "**LightClaw 测试 · ", 1)
+    return message.replace(
+        "企业微信机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
+        "本消息经当前飞书会话确认送达后，系统才会记录上述明确买入/卖出指令；持有、观察和空仓不产生交易。",
+    )
 
 
 def send_wecom_push(
@@ -772,6 +858,8 @@ def run_analysis(
     now: datetime | None = None,
     cutoff_minutes: int | None = None,
     stage: str | None = None,
+    persist: bool = True,
+    persistence_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
     if stage is not None and stage not in SCHEDULED_STAGES:
@@ -978,6 +1066,13 @@ def run_analysis(
         "breadth": breadth,
         "trading_dates": sorted(trading_dates),
         "capital": CAPITAL,
+        "strategy_version": STRATEGY_VERSION,
+        "parameters": {**DEFAULT_PARAMETERS, "capital": CAPITAL},
+        "universe_version": UNIVERSE_VERSION,
+        "stock_pool": list(WATCHLIST),
+        "stock_pool_hash": hashlib.sha256(
+            json.dumps(WATCHLIST, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
         "position_pct": round(sum(item["position_pct"] for item in display_candidates), 1),
         "candidates": display_candidates,
         "universe": universe,
@@ -990,8 +1085,20 @@ def run_analysis(
         "disclaimer": "自动筛选仅供研究参考，不构成个性化投资建议。公告关键词筛查不等于完整公告研读；隔夜跳空、涨跌停和流动性可能使计划价格无法成交。",
         "methodology": "1-3日短线策略 v2",
     }
-    if phase in ("decision", "tail-decision") and trade_date == now.strftime("%Y%m%d"):
+    should_persist = phase in ("decision", "tail-decision") and trade_date == now.strftime("%Y%m%d")
+    if persist and should_persist:
         persist_decision(response, parsed_minutes)
+    elif persistence_data is not None and should_persist:
+        persistence_data["minute_rows"] = parsed_minutes
+        persistence_data["execution_rows"] = {
+            symbol: {"records": [
+                {"time": parts[0], "price": as_number(parts[1]), "volume": as_number(parts[2])}
+                for raw in item.get("raw_records", [])
+                if len(parts := str(raw).split()) >= 3
+            ]}
+            for symbol, item in minute_raw.items()
+            if symbol not in BENCHMARKS
+        }
     return response
 
 
@@ -1275,6 +1382,167 @@ def apply_scheduled_report(
     return updated
 
 
+def lightclaw_prepare(
+    stage: str,
+    now: datetime | None = None,
+    state_path: Path | None = None,
+    test_message: bool = False,
+) -> dict[str, Any]:
+    if stage not in SCHEDULED_STAGES:
+        raise ValueError(f"未知定时阶段：{stage}")
+    now = now or datetime.now(SHANGHAI)
+    today = now.strftime("%Y%m%d")
+    event_id = f"{today}:{stage}"
+    with trading_state_transaction(state_path) as locked_path:
+        state = load_trading_state(locked_path)
+        if event_id in state.get("processed_events", []):
+            return {"status": "already_committed", "event_id": event_id}
+        pending = state.get("pending_report")
+        if pending:
+            pending_test_message = bool(pending.get("test_message", False))
+            if pending.get("event_id") != event_id or pending_test_message != test_message:
+                return {
+                    "status": "pending_conflict",
+                    "event_id": event_id,
+                    "test_message": test_message,
+                    "pending_event_id": pending.get("event_id", ""),
+                    "pending_test_message": pending_test_message,
+                    "reason": "存在未完成且标识不一致的 pending，请先提交该 pending",
+                }
+            return {
+                "status": "prepared",
+                "event_id": event_id,
+                "commit_token": pending["commit_token"],
+                "message": pending["message"],
+                "test_message": pending_test_message,
+                "reused": True,
+            }
+        persistence_data: dict[str, Any] = {}
+        analysis = run_analysis(
+            now=now, stage=stage, persist=False, persistence_data=persistence_data,
+        )
+        if analysis.get("trade_date") != today:
+            return {
+                "status": "skipped",
+                "reason": "行情不是当日数据，可能休市",
+                "trade_date": analysis.get("trade_date", ""),
+            }
+        market_data_minutes = hhmm_to_minutes(str(analysis.get("market_data_time", "")))
+        required_minutes = int(SCHEDULED_STAGES[stage]["cutoff"])
+        if market_data_minutes < required_minutes:
+            return {
+                "status": "skipped",
+                "reason": "行情尚未更新到该阶段截点",
+                "market_data_time": analysis.get("market_data_time", ""),
+                "required_time": minutes_to_hhmm(required_minutes),
+            }
+        report = build_scheduled_report(stage, analysis, state)
+        message = format_lightclaw_message(report, test=test_message)
+        token = secrets.token_urlsafe(32)
+        state["pending_report"] = {
+            "event_id": event_id,
+            "commit_token": token,
+            "prepared_at": now.isoformat(timespec="seconds"),
+            "test_message": test_message,
+            "message": message,
+            "report": report,
+            "execution_rows": persistence_data.get("execution_rows", {}),
+        }
+        save_trading_state(state, locked_path)
+    return {
+        "status": "prepared",
+        "event_id": event_id,
+        "commit_token": token,
+        "message": message,
+        "test_message": test_message,
+        "reused": False,
+    }
+
+
+def lightclaw_commit(
+    commit_token: str,
+    now: datetime | None = None,
+    state_path: Path | None = None,
+) -> dict[str, Any]:
+    if not commit_token:
+        raise ValueError("commit token 不能为空")
+    now = now or datetime.now(SHANGHAI)
+    with trading_state_transaction(state_path) as locked_path:
+        state = load_trading_state(locked_path)
+        committed_tokens = state.get("committed_delivery_tokens", {})
+        if commit_token in committed_tokens:
+            event_id = committed_tokens[commit_token]
+            archive_path = archive_path_for(locked_path, event_id)
+            if archive_path.exists():
+                try:
+                    archived = json.loads(archive_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise RuntimeError(f"正式归档无法读取：{error}") from error
+                if archived.get("archive_status") == "pending":
+                    committed_archive = {**archived, "archive_status": "committed"}
+                    archive_formal_event(archive_path, committed_archive)
+            return {
+                "status": "already_committed",
+                "event_id": event_id,
+                "open_holdings": len(state.get("holdings", [])),
+            }
+        pending = state.get("pending_report")
+        if not pending or not secrets.compare_digest(str(pending.get("commit_token", "")), commit_token):
+            raise ValueError("commit token 无效或不存在对应 pending")
+        report = pending.get("report")
+        if not isinstance(report, dict) or report.get("event_id") != pending.get("event_id"):
+            raise RuntimeError("pending report 格式无效")
+        if report["event_id"] in state.get("processed_events", []):
+            updated = copy.deepcopy(state)
+        else:
+            updated = apply_scheduled_report(state, report, now)
+        updated["pending_report"] = None
+        updated.setdefault("committed_delivery_tokens", {})[commit_token] = report["event_id"]
+        archive_path = None
+        formal_event = None
+        if not pending.get("test_message", False):
+            archive_path = archive_path_for(locked_path, report["event_id"])
+            if archive_path.exists():
+                try:
+                    formal_event = json.loads(archive_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise RuntimeError(f"正式归档无法读取：{error}") from error
+                if formal_event.get("archive_status") != "pending":
+                    raise RuntimeError("正式归档状态与交易状态不一致")
+                archive_formal_event(archive_path, formal_event)
+            else:
+                formal_event = build_formal_event(pending, now, pending.get("execution_rows"))
+                archive_formal_event(archive_path, {**formal_event, "archive_status": "pending"})
+        save_trading_state(updated, locked_path)
+        if archive_path is not None and formal_event is not None:
+            archive_formal_event(archive_path, {**formal_event, "archive_status": "committed"})
+    return {
+        "status": "committed",
+        "event_id": report["event_id"],
+        "trade_actions": report.get("trade_actions", 0),
+        "open_holdings": len(updated.get("holdings", [])),
+    }
+
+
+def scheduled_push_conflict(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    if event_id in state.get("processed_events", []):
+        return {
+            "sent": False,
+            "reason": "该阶段已经成功推送",
+            "event_id": event_id,
+        }
+    pending = state.get("pending_report")
+    if pending:
+        return {
+            "sent": False,
+            "reason": "存在未完成的 LightClaw pending，禁止企业微信外发和状态应用",
+            "status": "pending_conflict",
+            "event_id": event_id,
+            "pending_event_id": pending.get("event_id", ""),
+        }
+    return None
+
+
 def scheduled_push(
     stage: str,
     webhook: str,
@@ -1285,8 +1553,14 @@ def scheduled_push(
     webhook = validate_wecom_webhook(webhook)
     if stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
-    analysis = run_analysis(now=now, stage=stage)
     today = now.strftime("%Y%m%d")
+    event_id = f"{today}:{stage}"
+    with trading_state_transaction(state_path) as locked_path:
+        conflict = scheduled_push_conflict(load_trading_state(locked_path), event_id)
+        if conflict:
+            return conflict
+    persistence_data: dict[str, Any] = {}
+    analysis = run_analysis(now=now, stage=stage, persist=False, persistence_data=persistence_data)
     if analysis.get("trade_date") != today:
         return {
             "sent": False,
@@ -1302,18 +1576,18 @@ def scheduled_push(
             "market_data_time": analysis.get("market_data_time", ""),
             "required_time": minutes_to_hhmm(required_minutes),
         }
-    state = load_trading_state(state_path)
-    event_id = f"{today}:{stage}"
-    if event_id in state.get("processed_events", []):
-        return {
-            "sent": False,
-            "reason": "该阶段已经成功推送",
-            "event_id": event_id,
-        }
-    report = build_scheduled_report(stage, analysis, state)
-    send_wecom_push(report, webhook=webhook)
-    updated = apply_scheduled_report(state, report, now)
-    save_trading_state(updated, state_path)
+    with trading_state_transaction(state_path) as locked_path:
+        state = load_trading_state(locked_path)
+        conflict = scheduled_push_conflict(state, event_id)
+        if conflict:
+            return conflict
+        report = build_scheduled_report(stage, analysis, state)
+        minute_rows = persistence_data.get("minute_rows")
+        if minute_rows is not None:
+            persist_decision(analysis, minute_rows)
+        send_wecom_push(report, webhook=webhook)
+        updated = apply_scheduled_report(state, report, now)
+        save_trading_state(updated, locked_path)
     return {
         "sent": True,
         "trade_date": analysis.get("trade_date", ""),
@@ -1423,7 +1697,59 @@ def main() -> int:
         choices=tuple(SCHEDULED_STAGES),
         help="运行指定阶段的定时分析与推送",
     )
+    lightclaw_action = parser.add_mutually_exclusive_group()
+    lightclaw_action.add_argument(
+        "--lightclaw-prepare",
+        choices=tuple(SCHEDULED_STAGES),
+        help="生成 LightClaw 待发送消息并返回 commit token；本入口绝不外发",
+    )
+    lightclaw_action.add_argument(
+        "--lightclaw-commit",
+        metavar="TOKEN",
+        help="仅在上层确认飞书送达后提交对应 token",
+    )
+    parser.add_argument(
+        "--lightclaw-test-message",
+        action="store_true",
+        help="为并行观察期消息添加 LightClaw 测试标记",
+    )
+    parser.add_argument(
+        "--weekly-review",
+        action="store_true",
+        help="只读生成正式提交事件的周复盘 JSON；不外发、不修改交易状态或策略参数",
+    )
+    parser.add_argument("--as-of", help="周复盘截止日期（ISO 日期或时间）")
+    parser.add_argument("--weekly-config", type=Path, help="本地白名单 JSON 配置")
+    parser.add_argument("--config", type=Path, help="--weekly-config 的等价别名")
     args = parser.parse_args()
+    if args.weekly_review:
+        try:
+            if args.weekly_config is not None and args.config is not None:
+                raise ValueError("--weekly-config 与 --config 不得同时使用")
+            as_of = args.as_of or datetime.now(SHANGHAI).date().isoformat()
+            config = load_weekly_config(args.weekly_config or args.config)
+            archive_dir = Path(config.get("archive_dir", DATA_DIR / "formal-events"))
+            result = weekly_review(as_of, archive_dir, config)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        except ValueError as error:
+            print(json.dumps({"status": "error", "schema": "astock.weekly-review/v1", "errors": [str(error)]}, ensure_ascii=False))
+            return 1
+        except Exception as error:
+            print(json.dumps({"status": "corrupt_data", "schema": "astock.weekly-review/v1", "errors": [str(error)]}, ensure_ascii=False))
+            return 2
+    if args.lightclaw_prepare or args.lightclaw_commit:
+        try:
+            result = (
+                lightclaw_prepare(args.lightclaw_prepare, test_message=args.lightclaw_test_message)
+                if args.lightclaw_prepare
+                else lightclaw_commit(args.lightclaw_commit)
+            )
+            print(json.dumps(result, ensure_ascii=False))
+            return 3 if result.get("status") == "pending_conflict" else 0
+        except Exception as error:
+            print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
+            return 1
     if args.push_once or args.scheduled_push:
         webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
         if not webhook:
