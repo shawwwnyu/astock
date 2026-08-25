@@ -16,6 +16,8 @@ from typing import Any
 SCHEMA = "astock.weekly-review/v1"
 ARCHIVE_SCHEMA = "astock.formal-event/v1"
 STRATEGY_VERSION = "short-term-v2"
+INTRADAY_MIGRATION_DATE = date(2026, 8, 26)
+LEGACY_REQUIRED_STAGES = {"morning-summary", "morning-decision", "tail-decision", "close-summary"}
 DEFAULT_PARAMETERS = {
     "capital": 50_000,
     "max_holding_sessions": 3,
@@ -96,9 +98,7 @@ def seal_formal_event(event: dict[str, Any]) -> dict[str, Any]:
 def archive_formal_event(path: Path, event: dict[str, Any]) -> None:
     if event.get("schema") != ARCHIVE_SCHEMA or event.get("test_message") is not False:
         raise ValueError("only non-test formal events may enter the formal archive")
-    if not event.get("event_id") or event.get("stage") not in {
-        "morning-summary", "morning-decision", "tail-decision", "close-summary",
-    }:
+    if not event.get("event_id") or event.get("stage") not in LEGACY_REQUIRED_STAGES | {"intraday-scan"}:
         raise ValueError("invalid formal event")
     event = seal_formal_event(event)
     if path.exists():
@@ -129,7 +129,8 @@ def _next_minute(time_text: str) -> str:
 
 def execution_evidence(report: dict[str, Any], minute_rows: dict[str, Any] | None) -> list[dict[str, Any]]:
     rows = minute_rows or {}
-    cutoff = str(report.get("analysis", {}).get("market_data_time", "")).replace(":", "")
+    decision_minute = report.get("scan_time") if report.get("stage") == "intraday-scan" else report.get("analysis", {}).get("market_data_time", "")
+    cutoff = str(decision_minute).replace(":", "")
     expected = _next_minute(cutoff) if len(cutoff) == 4 and cutoff.isdigit() else ""
     actions: list[dict[str, Any]] = []
     raw_actions = []
@@ -147,8 +148,9 @@ def execution_evidence(report: dict[str, Any], minute_rows: dict[str, Any] | Non
         raw_record = None
         if isinstance(record, dict):
             raw_record = {key: record.get(key) for key in ("time", "price", "volume", "suspended", "at_limit") if key in record}
+        identity = str(item.get("id", "")) if side == "sell" else ""
         actions.append({
-            "action_id": f"{report.get('event_id')}:{side}:{code}",
+            "action_id": f"{report.get('event_id')}:{side}:{code}" + (f":{identity}" if identity else ""),
             "side": side,
             "code": code,
             "name": item.get("name", ""),
@@ -235,7 +237,7 @@ def build_formal_event(
         "version": 1,
         "event_id": report["event_id"],
         "stage": report["stage"],
-        "decision_at": analysis.get("generated_at") or pending.get("prepared_at"),
+        "decision_at": report.get("decision_at") or analysis.get("generated_at") or pending.get("prepared_at"),
         "strategy_version": analysis.get("strategy_version", STRATEGY_VERSION),
         "parameters": parameters,
         "universe_version": analysis.get("universe_version", "legacy-unversioned"),
@@ -349,8 +351,11 @@ def _load_events(archive_dir: Path, end: date) -> list[dict[str, Any]]:
             trade_date = _parse_date(str(event_id).split(":", 1)[0].replace("/", "-") if "-" in str(event_id).split(":", 1)[0] else f"{str(event_id)[:4]}-{str(event_id)[4:6]}-{str(event_id)[6:8]}")
             if trade_date <= end:
                 events.append(event)
-    stage_order = {"morning-summary": 0, "morning-decision": 1, "tail-decision": 2, "close-summary": 3}
-    events.sort(key=lambda item: (str(item.get("event_id", "")).split(":", 1)[0], stage_order.get(str(item.get("stage", "")), 99)))
+    stage_order = {"morning-summary": 0, "morning-decision": 1, "tail-decision": 2, "intraday-scan": 3, "close-summary": 4}
+    events.sort(key=lambda item: (
+        _event_day(item), str(item.get("decision_at", "")),
+        stage_order.get(str(item.get("stage", "")), 99), str(item.get("event_id", "")),
+    ))
     return events
 
 
@@ -370,6 +375,12 @@ def _max_drawdown(equity: list[dict[str, Any]]) -> float | None:
 def _event_day(event: dict[str, Any]) -> str:
     digits = str(event.get("event_id", "")).split(":", 1)[0].replace("-", "")
     return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+
+def _day_is_complete(day: str, stages: set[str]) -> bool:
+    if _parse_date(day) < INTRADAY_MIGRATION_DATE:
+        return stages == LEGACY_REQUIRED_STAGES
+    return "close-summary" in stages and stages <= {"close-summary", "intraday-scan"}
 
 
 def _candidate_evaluations(samples: Any, eligible: bool) -> list[dict[str, Any]]:
@@ -405,7 +416,6 @@ def weekly_review(as_of_text: str, archive_dir: Path, config: dict[str, Any] | N
     )
     calendar = sorted(str(value)[:10] for value in calendar_evidence.get("dates", [])) if calendar_verified else []
     expected_days = [value for value in calendar if start.isoformat() <= value <= end.isoformat()]
-    required_stages = {"morning-summary", "morning-decision", "tail-decision", "close-summary"}
     observed_stages: defaultdict[str, set[str]] = defaultdict(set)
     for event in current:
         observed_stages[_event_day(event)].add(str(event.get("stage", "")))
@@ -416,8 +426,8 @@ def weekly_review(as_of_text: str, archive_dir: Path, config: dict[str, Any] | N
         errors.append("verified complete trading-day calendar unavailable")
     elif not expected_days:
         errors.append("actual trading-day calendar unavailable")
-    elif any(observed_stages.get(day, set()) != required_stages for day in expected_days):
-        errors.append("formal four-stage ledger is incomplete for actual trading days")
+    elif any(not _day_is_complete(day, observed_stages.get(day, set())) for day in expected_days):
+        errors.append("formal daily ledger is incomplete for actual trading days")
 
     initial = float(config.get("initial_capital", 50_000))
     cash = initial
@@ -529,7 +539,7 @@ def weekly_review(as_of_text: str, archive_dir: Path, config: dict[str, Any] | N
     for day in calendar:
         parsed = _parse_date(day)
         calendar_weeks[(parsed.isocalendar().year, parsed.isocalendar().week)].append(day)
-    complete_weeks = sum(bool(days) and all(stages_by_day.get(day, set()) == required_stages for day in days) for days in calendar_weeks.values())
+    complete_weeks = sum(bool(days) and all(_day_is_complete(day, stages_by_day.get(day, set())) for day in days) for days in calendar_weeks.values())
     complete = bool(expected_days) and not any("incomplete" in error or "mark missing" in error for error in errors)
     available = complete and benchmark_return is not None and bool(equity) and opening_equity is not None
     status = "observational" if available else ("observational" if filled_orders else "insufficient_data")

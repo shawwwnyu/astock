@@ -2,10 +2,7 @@ name: Daily A-share push
 
 on:
   schedule:
-    # GitHub cron uses UTC; all business times below are Asia/Shanghai (UTC+8).
-    - cron: "0 2 * * 1-5"   # 10:00 early-market summary
-    - cron: "30 2 * * 1-5"  # 10:30 holding and trading decision
-    - cron: "30 6 * * 1-5"  # 14:30 tail-session decision
+    # GitHub cron uses UTC; business time below is Asia/Shanghai (UTC+8).
     - cron: "30 7 * * 1-5"  # 15:30 close summary (data cutoff 15:00)
   workflow_dispatch:
     inputs:
@@ -53,9 +50,6 @@ jobs:
           MANUAL_STAGE: ${{ inputs.stage }}
         run: |
           case "$EVENT_SCHEDULE" in
-            "0 2 * * 1-5") stage="morning-summary" ;;
-            "30 2 * * 1-5") stage="morning-decision" ;;
-            "30 6 * * 1-5") stage="tail-decision" ;;
             "30 7 * * 1-5") stage="close-summary" ;;
             *) stage="${MANUAL_STAGE:-tail-decision}" ;;
           esac

@@ -120,6 +120,25 @@ class WeeklyReviewTests(unittest.TestCase):
         self.assertEqual(missing["status"], "unfilled")
         self.assertIsNone(missing["filled_price"])
 
+    def test_intraday_execution_evidence_uses_scan_decision_next_minute(self):
+        candidate = {**self.candidate(), "last_time": "1000"}
+        analysis = self.analysis(
+            candidates=[candidate], universe=[{"code": "000001", "price": 10.0, "last_time": "1000"}],
+        )
+        analysis["market_data_time"] = "1001"
+        report, _, _ = server.build_intraday_scan_report(
+            analysis, server.empty_trading_state(), datetime(2026, 7, 29, 10, 0, tzinfo=server.SHANGHAI),
+        )
+        rows = {"sz000001": {"records": [{
+            "time": "1001", "price": 10.02, "volume": 2000, "suspended": False, "at_limit": False,
+        }]}}
+        action = weekly.execution_evidence(report, rows)[0]
+        self.assertEqual(action["expected_execution_minute"], "1001")
+        self.assertEqual(weekly.verify_archived_action(action)["status"], "filled")
+        missing = weekly.execution_evidence(report, {})[0]
+        self.assertEqual(missing["expected_execution_minute"], "1001")
+        self.assertEqual(weekly.verify_archived_action(missing)["status"], "unfilled")
+
     def test_production_archive_cannot_invent_thirteen_week_drawdown_history(self):
         with TemporaryDirectory() as directory:
             start = date(2026, 4, 6)
@@ -363,9 +382,11 @@ class WeeklyReviewTests(unittest.TestCase):
                "assumed_price": 10, "status": "assumed_filled", "tradability_verified": True}
         with TemporaryDirectory() as directory:
             for day in ("20261008", "20261009"):
-                for stage in ("morning-summary", "morning-decision", "tail-decision", "close-summary"):
-                    actions = [buy] if day == "20261008" and stage == "tail-decision" else []
-                    self.write_event(directory, self.formal_event(f"{day}:{stage}", actions))
+                scan = self.formal_event(f"{day}:scan:1400:fixture", [buy] if day == "20261008" else [])
+                scan["stage"] = "intraday-scan"
+                scan["decision_at"] = f"{day[:4]}-{day[4:6]}-{day[6:]}T14:00:00+08:00"
+                self.write_event(directory, scan)
+                self.write_event(directory, self.formal_event(f"{day}:close-summary"))
             verified = lambda day, price: {"price": price, "as_of": f"{day} 15:00", "verified_at_time": True}
             config = {
                 "trading_calendar": {"dates": ["2026-10-08", "2026-10-09"], "complete": True, "source": "offline fixture"},
@@ -550,6 +571,72 @@ class WeeklyReviewTests(unittest.TestCase):
             config.write_text(json.dumps({"candidate_evaluations": [{"parameters": {}}]}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "unsupported keys"):
                 weekly.load_config(config)
+
+    def test_intraday_scan_archive_and_same_day_order(self):
+        first = self.formal_event("20260826:scan:1000:aaa")
+        first.update({"stage": "intraday-scan", "decision_at": "2026-08-26T10:00:00+08:00"})
+        second = self.formal_event("20260826:scan:1300:bbb")
+        second.update({"stage": "intraday-scan", "decision_at": "2026-08-26T13:00:00+08:00"})
+        close = self.formal_event("20260826:close-summary")
+        close["decision_at"] = "2026-08-26T15:30:00+08:00"
+        with TemporaryDirectory() as directory:
+            self.write_event(directory, second)
+            self.write_event(directory, close)
+            self.write_event(directory, first)
+            events = weekly._load_events(Path(directory), date(2026, 8, 26))
+        self.assertEqual([event["event_id"] for event in events], [first["event_id"], second["event_id"], close["event_id"]])
+
+    def test_migration_daily_completeness_legacy_four_stage_and_scan_zero_or_many(self):
+        self.assertTrue(weekly._day_is_complete("2026-08-25", set(weekly.LEGACY_REQUIRED_STAGES)))
+        self.assertFalse(weekly._day_is_complete("2026-08-25", {"close-summary"}))
+        self.assertTrue(weekly._day_is_complete("2026-08-26", {"close-summary"}))
+        self.assertTrue(weekly._day_is_complete("2026-08-26", {"intraday-scan", "close-summary"}))
+        self.assertFalse(weekly._day_is_complete("2026-08-26", {"intraday-scan"}))
+        self.assertFalse(weekly._day_is_complete("2026-08-26", {"morning-summary", "close-summary"}))
+
+    def test_post_migration_close_only_day_is_complete_without_no_signal_event(self):
+        verified = lambda day, price: {"price": price, "as_of": f"{day} 15:00", "verified_at_time": True}
+        with TemporaryDirectory() as directory:
+            for day in ("20260826", "20260827"):
+                self.write_event(directory, self.formal_event(day.replace("-", "") + ":close-summary"))
+            result = weekly.weekly_review("2026-08-29", Path(directory), {
+                "trading_calendar": {"dates": ["2026-08-26", "2026-08-27"], "complete": True, "source": "fixture"},
+                "benchmark_closes": {day: verified(day, 4000) for day in ("2026-08-26", "2026-08-27")},
+                "mark_prices": {"2026-08-26": {}, "2026-08-27": {}},
+            })
+        self.assertTrue(result["data_quality"]["complete"])
+        self.assertEqual(result["data_quality"]["event_count"], 2)
+
+    def test_same_day_multiple_scan_t_plus_one_quantity_and_fees(self):
+        buy = {"action_id": "scan-buy", "side": "buy", "code": "000001", "shares": 100,
+               "assumed_price": 10, "status": "assumed_filled", "tradability_verified": True}
+        sell_same = {"action_id": "scan-sell-same", "side": "sell", "code": "000001", "shares": 100,
+                     "assumed_price": 11, "status": "assumed_filled", "tradability_verified": True}
+        sell_next = {**sell_same, "action_id": "scan-sell-next"}
+        verified = lambda day, price: {"price": price, "as_of": f"{day} 15:00", "verified_at_time": True}
+        with TemporaryDirectory() as directory:
+            for event_id, decision_at, actions in (
+                ("20260826:scan:1000:a", "2026-08-26T10:00:00+08:00", [buy]),
+                ("20260826:scan:1400:b", "2026-08-26T14:00:00+08:00", [sell_same]),
+                ("20260826:close-summary", "2026-08-26T15:30:00+08:00", []),
+                ("20260827:scan:1000:c", "2026-08-27T10:00:00+08:00", [sell_next]),
+                ("20260827:close-summary", "2026-08-27T15:30:00+08:00", []),
+            ):
+                event = self.formal_event(event_id, actions)
+                event["stage"] = "intraday-scan" if ":scan:" in event_id else "close-summary"
+                event["decision_at"] = decision_at
+                self.write_event(directory, event)
+            result = weekly.weekly_review("2026-08-29", Path(directory), {
+                "trading_calendar": {"dates": ["2026-08-26", "2026-08-27"], "complete": True, "source": "fixture"},
+                "benchmark_closes": {day: verified(day, 4000) for day in ("2026-08-26", "2026-08-27")},
+                "mark_prices": {day: {"000001": verified(day, 11)} for day in ("2026-08-26", "2026-08-27")},
+            })
+        executions = {row["action_id"]: row for row in result["performance"]["executions"]}
+        self.assertEqual(executions["scan-sell-same"]["status"], "rejected")
+        self.assertEqual(executions["scan-sell-next"]["executed_shares"], 100)
+        self.assertEqual(result["performance"]["commission"], 10.0)
+        self.assertEqual(result["performance"]["stamp_tax"], 0.55)
+        self.assertEqual(result["performance"]["slippage"], 2.1)
 
     def test_cli_json_exit_codes_read_only_offline_and_no_sensitive_env(self):
         with TemporaryDirectory() as directory:

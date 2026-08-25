@@ -482,10 +482,11 @@ class DashboardLogicTests(unittest.TestCase):
 
             def create_concurrent_pending(*args, **kwargs):
                 state = server.empty_trading_state()
-                state["pending_report"] = {
-                    "event_id": "20260729:tail-decision",
-                    "commit_token": "concurrent-token",
-                }
+                report = server.build_scheduled_report("tail-decision", analysis, state)
+                state["pending_report"] = server._build_pending(
+                    report, "c" * 32, server.format_lightclaw_message(report),
+                    now.isoformat(timespec="seconds"), False, {}, "scheduled",
+                )
                 with server.trading_state_transaction(state_path) as locked_path:
                     server.save_trading_state(state, locked_path)
                 return analysis
@@ -633,6 +634,528 @@ class DashboardLogicTests(unittest.TestCase):
             self.assertEqual(temporary_modes, [0o600])
             self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(data_dir.stat().st_mode & 0o777, directory_mode)
+
+    def test_scan_window_boundaries(self):
+        expected = {
+            (9, 29): False, (9, 30): False, (9, 35): True,
+            (11, 30): True, (11, 31): False, (12, 59): False,
+            (13, 0): True, (15, 0): True, (15, 1): False,
+        }
+        for (hour, minute), allowed in expected.items():
+            with self.subTest(hour=hour, minute=minute):
+                now = datetime(2026, 8, 25, hour, minute, tzinfo=server.SHANGHAI)
+                self.assertEqual(server.scan_window_status(now)[0], allowed)
+        weekend = datetime(2026, 8, 29, 10, 0, tzinfo=server.SHANGHAI)
+        self.assertFalse(server.scan_window_status(weekend)[0])
+
+    def scan_analysis(self, *, candidates=None, universe=None, trading_dates=None):
+        value = self.analysis(
+            trade_date="20260825", candidates=candidates, universe=universe,
+            trading_dates=trading_dates or ["20260824", "20260825"],
+        )
+        value.update({
+            "generated_at": "2026-08-25T10:00:00+08:00", "market_data_time": "1000",
+            "strategy_version": server.STRATEGY_VERSION, "parameters": dict(server.DEFAULT_PARAMETERS),
+            "universe_version": server.UNIVERSE_VERSION, "stock_pool": list(server.WATCHLIST),
+            "stock_pool_hash": "fixture", "capital": 50_000,
+        })
+        for stock in value["candidates"]:
+            stock.setdefault("last_time", "1000")
+        return value
+
+    def test_scan_same_buy_side_ignores_shares_price_and_rule_detail_changes(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        first_candidate = {**self.candidate(), "shares": 100, "price": 10.0, "last_time": "1000"}
+        first_analysis = self.scan_analysis(
+            candidates=[first_candidate], universe=[{"code": "000001", "price": 10.0, "last_time": "1000"}],
+        )
+        first_report, first_states, _ = server.build_intraday_scan_report(
+            first_analysis, server.empty_trading_state(), now,
+        )
+        self.assertEqual([(item["side"], item["shares"]) for item in first_report["actions"]], [("buy", 100)])
+
+        changed_candidate = {
+            **first_candidate, "shares": 200, "price": 10.8, "entry_range": "10.70-10.90",
+            "invalidation": 10.1, "resistance": 12.0,
+        }
+        changed_analysis = self.scan_analysis(
+            candidates=[changed_candidate], universe=[{"code": "000001", "price": 10.8, "last_time": "1000"}],
+        )
+        state = {
+            **server.empty_trading_state(), "signal_trade_date": "20260825", "signal_states": first_states,
+        }
+        with patch.dict(server.SCAN_REASON_CODES, {"buy": "strict-entry-detail-v2", "sell": "holding-exit-v1"}, clear=True):
+            changed_report, changed_states, _ = server.build_intraday_scan_report(changed_analysis, state, now)
+        self.assertEqual(changed_report["actions"], [])
+        self.assertEqual(changed_report["event_id"], "")
+        self.assertEqual(changed_states["000001"]["fingerprint"], first_states["000001"]["fingerprint"])
+
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with patch("server.run_analysis", side_effect=[first_analysis, changed_analysis]):
+                prepared = server.lightclaw_scan_prepare(now, state_path)
+                self.assertEqual(prepared["status"], "prepared")
+                server.lightclaw_commit(prepared["commit_token"], now, state_path)
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+            committed = server.load_trading_state(state_path)
+        self.assertEqual(committed["holdings"][0]["shares"], 100)
+        self.assertEqual(committed["holdings"][0]["buy_price"], 10.0)
+
+    def test_scan_stale_symbol_preserves_buy_until_fresh_same_side(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        fingerprint = server._signal_fingerprint("20260825", "000001", "buy")
+        state = {
+            **server.empty_trading_state(), "signal_trade_date": "20260825",
+            "signal_states": {"000001": {"side": "buy", "fingerprint": fingerprint}},
+        }
+        stale_candidate = {**self.candidate(), "shares": 200, "price": 10.8, "last_time": "0959"}
+        stale_analysis = self.scan_analysis(
+            candidates=[stale_candidate],
+            universe=[
+                {"code": "000001", "price": 10.8, "last_time": "0959"},
+                {"code": "000002", "price": 8.0, "last_time": "1000"},
+            ],
+        )
+        stale_report, stale_states, evaluated = server.build_intraday_scan_report(stale_analysis, state, now)
+        self.assertEqual(stale_report["actions"], [])
+        self.assertNotIn("000001", evaluated)
+        self.assertEqual(stale_states["000001"], state["signal_states"]["000001"])
+
+        fresh_candidate = {**stale_candidate, "last_time": "1000"}
+        fresh_analysis = self.scan_analysis(
+            candidates=[fresh_candidate], universe=[{"code": "000001", "price": 10.8, "last_time": "1000"}],
+        )
+        fresh_report, fresh_states, evaluated = server.build_intraday_scan_report(fresh_analysis, state, now)
+        self.assertEqual(fresh_report["actions"], [])
+        self.assertIn("000001", evaluated)
+        self.assertEqual(fresh_states["000001"]["side"], "buy")
+
+    def test_scan_fresh_none_clears_buy_and_later_buy_notifies_again(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        fingerprint = server._signal_fingerprint("20260825", "000001", "buy")
+        state = {
+            **server.empty_trading_state(), "signal_trade_date": "20260825",
+            "signal_states": {"000001": {"side": "buy", "fingerprint": fingerprint}},
+        }
+        no_buy = self.scan_analysis(universe=[{"code": "000001", "price": 10.0, "last_time": "1000"}])
+        no_buy_report, none_states, evaluated = server.build_intraday_scan_report(no_buy, state, now)
+        self.assertEqual(no_buy_report["actions"], [])
+        self.assertIn("000001", evaluated)
+        self.assertEqual(none_states["000001"]["side"], "none")
+
+        candidate = {**self.candidate(), "last_time": "1000"}
+        buy = self.scan_analysis(
+            candidates=[candidate], universe=[{"code": "000001", "price": 10.0, "last_time": "1000"}],
+        )
+        rebuy_state = {**state, "signal_states": none_states}
+        rebuy_report, _, _ = server.build_intraday_scan_report(buy, rebuy_state, now)
+        self.assertEqual([(item["side"], item["code"]) for item in rebuy_report["actions"]], [("buy", "000001")])
+
+    def test_scan_sell_notification_identity_tracks_holding_id(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        quote = {"code": "000001", "price": 9.0, "vwap": 10, "change_pct": -2,
+                 "tail_return_pct": -1, "trend": "空头排列", "last_time": "1000"}
+        old_holding = self.holding(buy_date="20260822")
+        old_fingerprint = server._signal_fingerprint(
+            "20260825", "000001", "sell", old_holding["id"],
+        )
+        previous = {
+            **server.empty_trading_state(), "holdings": [old_holding], "signal_trade_date": "20260825",
+            "signal_states": {"000001": {"side": "sell", "fingerprint": old_fingerprint}},
+        }
+        same_report, _, _ = server.build_intraday_scan_report(
+            self.scan_analysis(universe=[quote], trading_dates=["20260822", "20260825"]), previous, now,
+        )
+        self.assertEqual(same_report["actions"], [])
+
+        new_holding = self.holding(buy_date="20260821")
+        replacement = {**previous, "holdings": [new_holding]}
+        new_report, _, _ = server.build_intraday_scan_report(
+            self.scan_analysis(universe=[quote], trading_dates=["20260821", "20260825"]), replacement, now,
+        )
+        self.assertEqual([(item["side"], item["holding_id"]) for item in new_report["actions"]],
+                         [("sell", new_holding["id"])])
+
+    def test_scan_none_buy_persist_none_and_rebuy(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = self.candidate()
+        candidate["last_time"] = "1000"
+        no_buy = self.scan_analysis(universe=[{"code": "000001", "price": 10, "last_time": "1000"}])
+        buy = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "price": 10, "last_time": "1000"}])
+        later_candidate = {**candidate, "last_time": "1005"}
+        buy_later = self.scan_analysis(candidates=[later_candidate], universe=[{"code": "000001", "price": 10, "last_time": "1005"}])
+        buy_later["market_data_time"] = "1005"
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with patch("server.run_analysis", side_effect=[no_buy, buy, buy, no_buy, buy_later]):
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+                first = server.lightclaw_scan_prepare(now, state_path)
+                self.assertEqual(first["status"], "prepared")
+                server.lightclaw_commit(first["commit_token"], now, state_path)
+                cleared = server.load_trading_state(state_path)
+                cleared["holdings"] = []
+                server.save_trading_state(cleared, state_path)
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+                second = server.lightclaw_scan_prepare(now + timedelta(minutes=5), state_path)
+        self.assertEqual(second["status"], "prepared")
+        self.assertNotEqual(first["event_id"], second["event_id"])
+
+    def test_scan_same_minute_buy_none_buy_has_distinct_stable_archives(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = {**self.candidate(), "last_time": "1000"}
+        buy = self.scan_analysis(
+            candidates=[candidate], universe=[{"code": "000001", "price": 10, "last_time": "1000"}],
+        )
+        none = self.scan_analysis(universe=[{"code": "000001", "price": 10, "last_time": "1000"}])
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with patch("server.run_analysis", side_effect=[buy, none, buy]):
+                first = server.lightclaw_scan_prepare(now, state_path)
+                retry = server.lightclaw_scan_prepare(now, state_path)
+                self.assertEqual(retry["event_id"], first["event_id"])
+                self.assertEqual(retry["commit_token"], first["commit_token"])
+                server.lightclaw_commit(first["commit_token"], now, state_path)
+                state = server.load_trading_state(state_path)
+                state["holdings"] = []
+                server.save_trading_state(state, state_path)
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+                second = server.lightclaw_scan_prepare(now, state_path)
+                second_retry = server.lightclaw_scan_prepare(now, state_path)
+                self.assertEqual(second_retry["event_id"], second["event_id"])
+                self.assertEqual(second_retry["commit_token"], second["commit_token"])
+                server.lightclaw_commit(second["commit_token"], now, state_path)
+            archives = sorted((state_path.parent / "formal-events").glob("*.json"))
+            final_state = server.load_trading_state(state_path)
+        self.assertNotEqual(first["event_id"], second["event_id"])
+        self.assertEqual(len(archives), 2)
+        self.assertEqual(final_state["signal_states"]["000001"]["generation"], 2)
+
+    def test_scan_sell_priority_t_plus_one_and_missing_holding_quote_blocks_buy(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        buy_candidate = self.candidate("000002")
+        buy_candidate["last_time"] = "1000"
+        t0 = self.holding(buy_date="20260825")
+        old = self.holding(buy_date="20260822")
+        sell_stock = {"code": "000001", "price": 9.0, "vwap": 10, "change_pct": -2,
+                      "tail_return_pct": -1, "trend": "空头排列", "last_time": "1000"}
+        analysis = self.scan_analysis(candidates=[buy_candidate], universe=[sell_stock, {"code": "000002", "last_time": "1000"}], trading_dates=["20260822", "20260825"])
+        t0_report, _, _ = server.build_intraday_scan_report(analysis, {**server.empty_trading_state(), "holdings": [t0]}, now)
+        self.assertEqual(t0_report["actions"], [])
+        sell_report, _, _ = server.build_intraday_scan_report(analysis, {**server.empty_trading_state(), "holdings": [old]}, now)
+        self.assertEqual([item["side"] for item in sell_report["actions"]], ["sell"])
+        missing_analysis = self.scan_analysis(candidates=[buy_candidate], universe=[{"code": "000002", "last_time": "1000"}])
+        missing_report, states, _ = server.build_intraday_scan_report(
+            missing_analysis,
+            {**server.empty_trading_state(), "holdings": [old], "signal_trade_date": "20260825",
+             "signal_states": {"000001": {"side": "sell", "fingerprint": "keep"}}}, now,
+        )
+        self.assertEqual(missing_report["actions"], [])
+        self.assertEqual(states["000001"]["fingerprint"], "keep")
+
+    def test_scan_multiple_sells_and_buys_are_stably_sorted_and_batched(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        holdings = [self.holding("000002", "20260822"), self.holding("000001", "20260822")]
+        sell_universe = [
+            {"code": code, "price": 9.0, "vwap": 10, "change_pct": -2,
+             "tail_return_pct": -1, "trend": "空头排列", "last_time": "1000"}
+            for code in ("000002", "000001")
+        ]
+        sell_report, _, _ = server.build_intraday_scan_report(
+            self.scan_analysis(universe=sell_universe, trading_dates=["20260822", "20260825"]),
+            {**server.empty_trading_state(), "holdings": holdings}, now,
+        )
+        self.assertEqual([(item["side"], item["code"]) for item in sell_report["actions"]],
+                         [("sell", "000001"), ("sell", "000002")])
+        buys = [self.candidate("000002"), self.candidate("000001")]
+        for item in buys:
+            item["last_time"] = "1000"
+        buy_report, _, _ = server.build_intraday_scan_report(
+            self.scan_analysis(candidates=buys, universe=[{"code": "000002"}, {"code": "000001"}]),
+            server.empty_trading_state(), now,
+        )
+        self.assertEqual([(item["side"], item["code"]) for item in buy_report["actions"]],
+                         [("buy", "000001"), ("buy", "000002")])
+        self.assertEqual(buy_report["trade_actions"], 2)
+        self.assertTrue(buy_report["event_id"].startswith("20260825:scan:1000:"))
+
+    def test_scan_same_stock_cannot_be_rebought_after_same_day_round_trip(self):
+        now = datetime(2026, 8, 25, 13, 0, tzinfo=server.SHANGHAI)
+        candidate = self.candidate()
+        candidate["last_time"] = "1300"
+        state = server.empty_trading_state()
+        state["history"] = [{**self.holding(buy_date="20260825"), "status": "closed"}]
+        report, _, _ = server.build_intraday_scan_report(
+            self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1300"}]),
+            state, now,
+        )
+        self.assertEqual(report["actions"], [])
+
+    def test_scan_pending_reuse_conflict_and_no_webhook_access(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = self.candidate()
+        candidate["last_time"] = "1000"
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with patch.dict("os.environ", {"WECOM_WEBHOOK": "must-not-read", "RESOURCE_STATS_FEISHU_WEBHOOK": "must-not-read"}, clear=True), \
+                 patch("server.run_analysis", return_value=analysis) as analyzer, \
+                 patch("server.send_wecom_push") as sender, patch("urllib.request.urlopen") as network:
+                first = server.lightclaw_scan_prepare(now, state_path)
+                reused = server.lightclaw_scan_prepare(now, state_path)
+                conflict = server.lightclaw_scan_prepare(now + timedelta(minutes=5), state_path)
+            mode = state_path.stat().st_mode & 0o777
+        self.assertEqual(first["status"], "prepared")
+        self.assertEqual(reused["status"], "already_pending")
+        self.assertEqual(reused["commit_token"], first["commit_token"])
+        self.assertEqual(conflict["status"], "conflict")
+        self.assertEqual(analyzer.call_count, 1)
+        self.assertEqual(mode, 0o600)
+        sender.assert_not_called()
+        network.assert_not_called()
+
+    def test_scan_pending_corruption_fails_stop_without_analysis_or_overwrite(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = {**self.candidate(), "last_time": "1000"}
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
+        for mutation in ("bogus", "hash_mismatch", "forged_fingerprint"):
+            with self.subTest(mutation=mutation), TemporaryDirectory() as directory:
+                state_path = Path(directory) / "state.json"
+                with patch("server.run_analysis", return_value=analysis):
+                    server.lightclaw_scan_prepare(now, state_path)
+                state = server.load_trading_state(state_path)
+                if mutation == "bogus":
+                    state["pending_report"] = {"event_id": "20260825:scan:1000:bogus", "commit_token": ""}
+                elif mutation == "hash_mismatch":
+                    state["pending_report"]["report"]["actions"][0]["shares"] += 100
+                else:
+                    pending = state["pending_report"]
+                    pending["report"]["actions"][0]["shares"] += 100
+                    pending["integrity_hash"] = server._pending_integrity_hash(pending)
+                server.save_trading_state(state, state_path)
+                before = state_path.read_bytes()
+                with patch("server.run_analysis") as analyzer:
+                    with self.assertRaises(server.CorruptLocalData):
+                        server.lightclaw_scan_prepare(now, state_path)
+                self.assertEqual(state_path.read_bytes(), before)
+                analyzer.assert_not_called()
+
+    def test_pending_non_none_invalid_values_fail_stop_all_entries(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        for invalid in ({}, [], "x"):
+            with self.subTest(invalid=invalid), TemporaryDirectory() as directory:
+                state_path = Path(directory) / "state.json"
+                state = server.empty_trading_state()
+                state["pending_report"] = invalid
+                server.save_trading_state(state, state_path)
+                before = state_path.read_bytes()
+                with patch("server.run_analysis") as analyzer, patch("server.send_wecom_push") as sender:
+                    for entry in (
+                        lambda: server.lightclaw_scan_prepare(now, state_path),
+                        lambda: server.lightclaw_prepare("morning-summary", now, state_path),
+                        lambda: server.lightclaw_commit("c" * 32, now, state_path),
+                        lambda: server.scheduled_push("morning-summary", self.WEBHOOK, now, state_path),
+                    ):
+                        with self.assertRaises(server.CorruptLocalData):
+                            entry()
+                self.assertEqual(state_path.read_bytes(), before)
+                analyzer.assert_not_called()
+                sender.assert_not_called()
+
+    def test_corrupt_empty_pending_cli_is_single_json_exit_two(self):
+        output = io.StringIO()
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = server.empty_trading_state()
+            state["pending_report"] = {}
+            server.save_trading_state(state, state_path)
+            with patch.object(sys, "argv", ["server.py", "--lightclaw-scan-prepare"]), patch(
+                "server.TRADING_STATE_PATH", state_path,
+            ), patch("server.run_analysis") as analyzer, patch("sys.stdout", output):
+                self.assertEqual(server.main(), 2)
+            analyzer.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["status"], "corrupt_data")
+        self.assertEqual(output.getvalue().count("\n"), 1)
+
+    def test_scheduled_push_corrupt_pending_cli_fails_stop_with_single_json_exit_two(self):
+        for invalid in ({}, [], "x"):
+            with self.subTest(invalid=invalid), TemporaryDirectory() as directory:
+                state_path = Path(directory) / "state.json"
+                state = server.empty_trading_state()
+                state["pending_report"] = invalid
+                server.save_trading_state(state, state_path)
+                before = state_path.read_bytes()
+                output = io.StringIO()
+                with patch.object(sys, "argv", ["server.py", "--scheduled-push", "morning-summary"]), patch(
+                    "server.TRADING_STATE_PATH", state_path,
+                ), patch.dict("os.environ", {"WECOM_WEBHOOK": self.WEBHOOK}, clear=True), patch(
+                    "server.run_analysis",
+                ) as analyzer, patch("server.send_wecom_push") as sender, patch(
+                    "server.save_trading_state",
+                ) as state_writer, patch("urllib.request.urlopen") as network, patch("sys.stdout", output):
+                    self.assertEqual(server.main(), 2)
+                self.assertEqual(state_path.read_bytes(), before)
+                self.assertEqual(output.getvalue().count("\n"), 1)
+                self.assertEqual(json.loads(output.getvalue())["sent"], False)
+                analyzer.assert_not_called()
+                sender.assert_not_called()
+                state_writer.assert_not_called()
+                network.assert_not_called()
+
+    def test_pending_rejects_rehashed_forged_message_on_prepare_and_commit(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = {**self.candidate(), "last_time": "1000"}
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
+        for entry_name in ("prepare", "commit"):
+            with self.subTest(entry=entry_name), TemporaryDirectory() as directory:
+                state_path = Path(directory) / "state.json"
+                with patch("server.run_analysis", return_value=analysis):
+                    prepared = server.lightclaw_scan_prepare(now, state_path)
+                state = server.load_trading_state(state_path)
+                state["pending_report"]["message"] = "FORGED MESSAGE"
+                state["pending_report"]["integrity_hash"] = server._pending_integrity_hash(state["pending_report"])
+                server.save_trading_state(state, state_path)
+                before = state_path.read_bytes()
+                with patch("server.run_analysis") as analyzer:
+                    with self.assertRaises(server.CorruptLocalData):
+                        if entry_name == "prepare":
+                            server.lightclaw_scan_prepare(now, state_path)
+                        else:
+                            server.lightclaw_commit(prepared["commit_token"], now, state_path)
+                self.assertEqual(state_path.read_bytes(), before)
+                self.assertFalse(server.archive_path_for(state_path, prepared["event_id"]).exists())
+                analyzer.assert_not_called()
+
+    def test_pending_rejects_rehashed_forged_execution_rows_on_prepare_and_commit(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = {**self.candidate(), "last_time": "1000"}
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
+        source = {"sz000001": {"records": [{"time": "1001", "price": 10.02, "volume": 2000, "suspended": False, "at_limit": False}]}}
+        for entry_name in ("prepare", "commit"):
+            with self.subTest(entry=entry_name), TemporaryDirectory() as directory:
+                state_path = Path(directory) / "state.json"
+
+                def analyze(**kwargs):
+                    kwargs["persistence_data"]["execution_rows"] = source
+                    return analysis
+
+                with patch("server.run_analysis", side_effect=analyze):
+                    prepared = server.lightclaw_scan_prepare(now, state_path)
+                state = server.load_trading_state(state_path)
+                state["pending_report"]["execution_rows"]["sz000001"]["records"][0].update(
+                    {"price": 99.99, "volume": 999999},
+                )
+                state["pending_report"]["integrity_hash"] = server._pending_integrity_hash(state["pending_report"])
+                server.save_trading_state(state, state_path)
+                before = state_path.read_bytes()
+                with patch("server.run_analysis") as analyzer:
+                    with self.assertRaises(server.CorruptLocalData):
+                        if entry_name == "prepare":
+                            server.lightclaw_scan_prepare(now, state_path)
+                        else:
+                            server.lightclaw_commit(prepared["commit_token"], now, state_path)
+                self.assertEqual(state_path.read_bytes(), before)
+                self.assertFalse(server.archive_path_for(state_path, prepared["event_id"]).exists())
+                analyzer.assert_not_called()
+
+    def test_scan_corrupt_pending_cli_is_single_json_exit_two(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["server.py", "--lightclaw-scan-prepare"]), patch(
+            "server.lightclaw_scan_prepare", side_effect=server.CorruptLocalData("pending integrity hash 无效"),
+        ), patch("sys.stdout", output):
+            self.assertEqual(server.main(), 2)
+        self.assertEqual(json.loads(output.getvalue())["status"], "corrupt_data")
+        self.assertEqual(output.getvalue().count("\n"), 1)
+
+    def test_scan_stale_and_incomplete_market_are_noop_without_signal_reset(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        stale = self.scan_analysis()
+        stale["trade_date"] = "20260822"
+        early = self.scan_analysis()
+        early["market_data_time"] = "0959"
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            initial = server.empty_trading_state()
+            initial.update({"signal_trade_date": "20260822", "signal_states": {"000001": {"side": "buy", "fingerprint": "old"}}})
+            server.save_trading_state(initial, state_path)
+            before = state_path.read_bytes()
+            with patch("server.run_analysis", side_effect=[stale, early]):
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+                self.assertEqual(server.lightclaw_scan_prepare(now, state_path)["status"], "no_signal")
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_scan_pending_archives_strict_next_minute_execution_evidence(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = {**self.candidate(), "last_time": "1000"}
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
+        rows = {"sz000001": {"records": [{"time": "1001", "price": 10.02, "volume": 2000, "suspended": False, "at_limit": False}]}}
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+
+            def analyze(**kwargs):
+                kwargs["persistence_data"]["execution_rows"] = rows
+                return analysis
+
+            with patch("server.run_analysis", side_effect=analyze):
+                prepared = server.lightclaw_scan_prepare(now, state_path)
+            pending = server.load_trading_state(state_path)["pending_report"]
+            server.lightclaw_commit(prepared["commit_token"], now, state_path)
+            archive = json.loads(server.archive_path_for(state_path, prepared["event_id"]).read_text(encoding="utf-8"))
+        self.assertEqual(pending["execution_rows"], rows)
+        self.assertEqual(archive["actions"][0]["expected_execution_minute"], "1001")
+        self.assertEqual(archive["actions"][0]["raw_next_minute"]["time"], "1001")
+
+    def test_scan_missing_strict_next_minute_commits_as_unfilled(self):
+        now = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
+        candidate = {**self.candidate(), "last_time": "1000"}
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
+        later_only = {"sz000001": {"records": [{"time": "1002", "price": 10.03, "volume": 3000, "suspended": False, "at_limit": False}]}}
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+
+            def analyze(**kwargs):
+                kwargs["persistence_data"]["execution_rows"] = later_only
+                return analysis
+
+            with patch("server.run_analysis", side_effect=analyze):
+                prepared = server.lightclaw_scan_prepare(now, state_path)
+            pending = server.load_trading_state(state_path)["pending_report"]
+            reused = server.lightclaw_scan_prepare(now, state_path)
+            server.lightclaw_commit(prepared["commit_token"], now, state_path)
+            archive = json.loads(server.archive_path_for(state_path, prepared["event_id"]).read_text(encoding="utf-8"))
+        self.assertEqual(reused["status"], "already_pending")
+        self.assertEqual(reused["commit_token"], prepared["commit_token"])
+        self.assertEqual(pending["execution_rows"], {"sz000001": {"records": []}})
+        self.assertEqual(archive["actions"][0]["expected_execution_minute"], "1001")
+        self.assertIsNone(archive["actions"][0]["raw_next_minute"])
+
+    def test_scan_commit_uses_real_time_and_is_idempotent(self):
+        now = datetime(2026, 8, 25, 13, 5, tzinfo=server.SHANGHAI)
+        candidate = self.candidate()
+        candidate["last_time"] = "1305"
+        analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1305"}])
+        analysis["market_data_time"] = "1305"
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with patch("server.run_analysis", return_value=analysis):
+                prepared = server.lightclaw_scan_prepare(now, state_path)
+            first = server.lightclaw_commit(prepared["commit_token"], now, state_path)
+            second = server.lightclaw_commit(prepared["commit_token"], now, state_path)
+            state = server.load_trading_state(state_path)
+        self.assertEqual(first["status"], "committed")
+        self.assertEqual(second["status"], "already_committed")
+        self.assertEqual(state["holdings"][0]["buy_time"], "1305")
+        self.assertIn("仅供研究参考，不构成个性化投资建议", prepared["message"])
+        self.assertIn("本地假定持仓", prepared["message"])
+
+    def test_scan_cli_stdout_is_single_json_and_conflict_nonzero(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["server.py", "--lightclaw-scan-prepare"]), \
+             patch("server.lightclaw_scan_prepare", return_value={"status": "conflict"}), \
+             patch.dict("os.environ", {"WECOM_WEBHOOK": "sentinel"}, clear=True), patch("sys.stdout", output):
+            self.assertEqual(server.main(), 3)
+        self.assertEqual(json.loads(output.getvalue()), {"status": "conflict"})
+        self.assertEqual(output.getvalue().count("\n"), 1)
 
     def test_lightclaw_concurrent_prepare_has_single_pending_token(self):
         now = datetime(2026, 7, 29, 14, 30, tzinfo=server.SHANGHAI)

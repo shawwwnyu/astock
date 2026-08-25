@@ -11,6 +11,7 @@ import hashlib
 import math
 import os
 import secrets
+import re
 import threading
 import time
 import urllib.parse
@@ -38,6 +39,13 @@ CAPITAL = 50_000
 CACHE_SECONDS = 55
 MAX_HOLDING_SESSIONS = 3
 UNIVERSE_VERSION = "2026-08-25.1"
+SCAN_WINDOWS = ((9 * 60 + 35, 11 * 60 + 30), (13 * 60, 15 * 60))
+SCAN_REASON_CODES = {"buy": "strict-entry-v1", "sell": "holding-exit-v1"}
+PENDING_SCHEMA = "astock.pending-report/v1"
+
+
+class CorruptLocalData(RuntimeError):
+    pass
 
 WATCHLIST = [
     "300740", "000909", "002080", "300007", "002318", "300398", "300847",
@@ -200,7 +208,7 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
 
 def empty_trading_state() -> dict[str, Any]:
     return {
-        "version": 3,
+        "version": 4,
         "updated_at": "",
         "holdings": [],
         "history": [],
@@ -208,6 +216,8 @@ def empty_trading_state() -> dict[str, Any]:
         "committed_deliveries": [],
         "committed_delivery_tokens": {},
         "pending_report": None,
+        "signal_trade_date": "",
+        "signal_states": {},
     }
 
 
@@ -264,7 +274,15 @@ def load_trading_state(path: Path | None = None) -> dict[str, Any]:
         if isinstance(token, str) and isinstance(event_id, str):
             normalized["committed_delivery_tokens"].setdefault(token, event_id)
     if normalized.get("pending_report") is not None and not isinstance(normalized["pending_report"], dict):
-        raise RuntimeError("交易状态字段 pending_report 格式无效")
+        raise CorruptLocalData("交易状态字段 pending_report 格式无效")
+    if not isinstance(normalized.get("signal_states"), dict):
+        raise RuntimeError("交易状态字段 signal_states 格式无效")
+    normalized["signal_states"] = {
+        str(code): value for code, value in normalized["signal_states"].items()
+        if isinstance(code, str) and isinstance(value, dict)
+        and value.get("side") in {"buy", "sell", "none"}
+    }
+    normalized["version"] = 4
     normalized["holdings"] = [
         item for item in normalized["holdings"]
         if isinstance(item, dict) and item.get("status", "open") == "open"
@@ -860,10 +878,15 @@ def run_analysis(
     stage: str | None = None,
     persist: bool = True,
     persistence_data: dict[str, Any] | None = None,
+    mode: str = "scheduled",
 ) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
     if stage is not None and stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
+    if mode not in {"scheduled", "intraday-scan"}:
+        raise ValueError(f"未知分析模式：{mode}")
+    if mode == "intraday-scan" and stage is not None:
+        raise ValueError("盘中扫描不得伪造固定阶段")
     current_minutes = now.hour * 60 + now.minute
     if cutoff_minutes is None:
         if stage:
@@ -899,6 +922,9 @@ def run_analysis(
     if stage:
         phase = stage
         phase_label = SCHEDULED_STAGES[stage]["label"]
+    elif mode == "intraday-scan":
+        phase = "intraday-scan"
+        phase_label = f"盘中扫描 {minutes_to_hhmm(cutoff_minutes)}"
     parsed_minutes: dict[str, dict[str, Any]] = {}
     for symbol, raw in minute_raw.items():
         if raw.get("trade_date") != trade_date:
@@ -967,7 +993,7 @@ def run_analysis(
         item["eligible"] = not item["failures"]
     securities.sort(key=lambda item: (item["eligible"], item["score"]), reverse=True)
     strict_candidates = [item for item in securities if not item["failures"]]
-    entry_phase = phase in ("decision", "morning-decision", "tail-decision")
+    entry_phase = phase in ("decision", "morning-decision", "tail-decision", "intraday-scan")
     actionable = entry_phase and market["state"] != "red"
     max_recommendations = 1 if market["state"] == "yellow" else 2
     total_limit = 30 if market["state"] == "yellow" else 60
@@ -988,7 +1014,7 @@ def run_analysis(
         if len(resized) == len(recommendations):
             break
         recommendations = resized
-    entry_time = "10:30" if phase == "morning-decision" else "14:30"
+    entry_time = minutes_to_hhmm(cutoff_minutes) if phase == "intraday-scan" else ("10:30" if phase == "morning-decision" else "14:30")
     if recommendations:
         decision = "buy"
         headline = f"{len(recommendations)} 个条件式买点"
@@ -1085,7 +1111,7 @@ def run_analysis(
         "disclaimer": "自动筛选仅供研究参考，不构成个性化投资建议。公告关键词筛查不等于完整公告研读；隔夜跳空、涨跌停和流动性可能使计划价格无法成交。",
         "methodology": "1-3日短线策略 v2",
     }
-    should_persist = phase in ("decision", "tail-decision") and trade_date == now.strftime("%Y%m%d")
+    should_persist = phase in ("decision", "tail-decision", "intraday-scan") and trade_date == now.strftime("%Y%m%d")
     if persist and should_persist:
         persist_decision(response, parsed_minutes)
     elif persistence_data is not None and should_persist:
@@ -1190,7 +1216,7 @@ def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dic
             and as_number(stock.get("tail_return_pct"), 0) < -0.4
         )
         if early_weak:
-            sell_reasons.append("10:00-10:30价格弱于分时均价且低点继续下移")
+            sell_reasons.append("盘中价格弱于分时均价且近期低点继续下移")
         if (
             market.get("state") == "red"
             and as_number(stock.get("change_pct"), 0) < 0
@@ -1206,7 +1232,7 @@ def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dic
             reasons = list(dict.fromkeys(sell_reasons))
         else:
             decision = "hold"
-            reasons = ["未触发失效位、目标位或早盘转弱卖点"]
+            reasons = ["未触发失效位、目标位或盘中转弱卖点"]
         reviews.append({
             "holding": copy.deepcopy(holding),
             "decision": decision,
@@ -1337,7 +1363,7 @@ def apply_scheduled_report(
         closed.update({
             "status": "closed",
             "sell_date": report["analysis"].get("trade_date", ""),
-            "sell_time": "1030",
+            "sell_time": report.get("scan_time", "1030"),
             "sell_price": review.get("current_price"),
             "return_pct": review.get("return_pct"),
             "sell_reason": "；".join(review.get("reasons", [])),
@@ -1346,7 +1372,7 @@ def apply_scheduled_report(
     updated["holdings"] = remaining
     existing_codes = {str(item.get("code")) for item in remaining}
     stage = report["stage"]
-    buy_time = minutes_to_hhmm(SCHEDULED_STAGES[stage]["cutoff"]).replace(":", "")
+    buy_time = report.get("scan_time") or minutes_to_hhmm(SCHEDULED_STAGES[stage]["cutoff"]).replace(":", "")
     trade_date = report["analysis"].get("trade_date", "")
     for stock in report.get("buys", []):
         code = str(stock.get("code", ""))
@@ -1365,7 +1391,7 @@ def apply_scheduled_report(
             "capital_used": round(shares * price, 2),
             "invalidation": stock.get("invalidation"),
             "target_price": stock.get("resistance"),
-            "source": "morning" if stage == "morning-decision" else "tail",
+            "source": "scan" if stage == "intraday-scan" else ("morning" if stage == "morning-decision" else "tail"),
             "status": "open",
         })
         existing_codes.add(code)
@@ -1374,12 +1400,428 @@ def apply_scheduled_report(
         processed.append(report["event_id"])
     updated["processed_events"] = processed[-120:]
     updated["history"] = updated.get("history", [])[-200:]
+    if report.get("stage") == "intraday-scan":
+        updated["signal_trade_date"] = trade_date
+        updated["signal_states"] = copy.deepcopy(report.get("signal_states", {}))
+        for code in sold_by_code:
+            generation = updated["signal_states"].get(code, {}).get("generation", 0)
+            updated["signal_states"][code] = {
+                "side": "none", "fingerprint": "", "generation": generation,
+                "updated_at": now.isoformat(timespec="seconds"),
+            }
     updated["updated_at"] = now.isoformat(timespec="seconds")
     updated["last_event"] = {
         "id": report["event_id"],
         "trade_actions": report.get("trade_actions", 0),
     }
     return updated
+
+
+def scan_window_status(now: datetime) -> tuple[bool, str]:
+    if now.weekday() >= 5:
+        return False, "周末非交易日"
+    minutes = now.hour * 60 + now.minute
+    if minutes < 9 * 60 + 35:
+        return False, "09:35前不生成盘中信号"
+    if not any(start <= minutes <= end for start, end in SCAN_WINDOWS):
+        return False, "当前不在盘中扫描窗口"
+    return True, ""
+
+
+def _signal_fingerprint(
+    trade_date: str, code: str, side: str, holding_id: str = "",
+) -> str:
+    core = {
+        "trade_date": trade_date,
+        "symbol": code,
+        "side": side,
+        "strategy_version": STRATEGY_VERSION,
+        "holding_id": holding_id,
+    }
+    return hashlib.sha256(
+        json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _notification_fingerprint(action: dict[str, Any]) -> str:
+    core = {
+        "signal_fingerprint": action["fingerprint"],
+        "generation": action["generation"],
+    }
+    return hashlib.sha256(
+        json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def build_intraday_scan_report(
+    analysis: dict[str, Any], state: dict[str, Any], now: datetime,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], set[str]]:
+    trade_date = str(analysis.get("trade_date", ""))
+    cutoff = now.strftime("%H%M")
+    universe = stock_lookup(analysis)
+    reviews = review_holdings(state, analysis)
+    unavailable = {
+        str(item["holding"].get("code")) for item in reviews
+        if item.get("current_price") is None
+        or hhmm_to_minutes(str(universe.get(str(item["holding"].get("code")), {}).get("last_time", "")))
+        < hhmm_to_minutes(cutoff)
+    }
+    sells = [
+        item for item in reviews
+        if item.get("decision") == "sell" and str(item["holding"].get("code")) not in unavailable
+    ]
+    held_codes = {str(item.get("code")) for item in state.get("holdings", [])}
+    bought_today = {
+        str(item.get("code")) for item in state.get("history", [])
+        if str(item.get("buy_date", "")).replace("-", "") == trade_date
+    }
+    buys = []
+    if not sells and not unavailable and not held_codes:
+        buys = [
+            copy.deepcopy(item) for item in analysis.get("candidates", [])
+            if str(item.get("code")) not in held_codes | bought_today
+            and int(as_number(item.get("shares"), 0) or 0) > 0
+            and hhmm_to_minutes(str(item.get("last_time", ""))) >= hhmm_to_minutes(cutoff)
+        ]
+    actions: list[dict[str, Any]] = []
+    for review in sells:
+        holding = review["holding"]
+        code = str(holding.get("code", ""))
+        shares = int(as_number(holding.get("shares"), 0) or 0)
+        fingerprint = _signal_fingerprint(trade_date, code, "sell", str(holding.get("id", "")))
+        actions.append({
+            "side": "sell", "code": code, "name": holding.get("name", ""),
+            "shares": shares, "price": review.get("current_price"),
+            "holding_id": holding.get("id", ""), "holding": copy.deepcopy(holding),
+            "holding_session": review.get("holding_session", 0),
+            "reasons": review.get("reasons", []), "reason_code": SCAN_REASON_CODES["sell"],
+            "fingerprint": fingerprint,
+        })
+    for stock in buys:
+        code = str(stock.get("code", ""))
+        shares = int(as_number(stock.get("shares"), 0) or 0)
+        fingerprint = _signal_fingerprint(trade_date, code, "buy")
+        actions.append({
+            "side": "buy", "code": code, "name": stock.get("name", ""),
+            "shares": shares, "price": stock.get("price"), "entry_range": stock.get("entry_range"),
+            "invalidation": stock.get("invalidation"), "resistance": stock.get("resistance"),
+            "reasons": ["通过市场、技术、分时、收益风险比与公告硬门槛"],
+            "reason_code": SCAN_REASON_CODES["buy"], "fingerprint": fingerprint,
+            "stock": stock,
+        })
+    actions.sort(key=lambda item: (0 if item["side"] == "sell" else 1, item["code"], item.get("holding_id", "")))
+
+    previous = state.get("signal_states", {}) if state.get("signal_trade_date") == trade_date else {}
+    next_states = copy.deepcopy(previous)
+    evaluated: set[str] = set()
+
+    def update_signal_state(code: str, action: dict[str, Any] | None) -> None:
+        prior = previous.get(code, {})
+        generation = prior.get("generation", 0)
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            generation = 0
+        if action is None:
+            next_states[code] = {
+                "side": "none", "fingerprint": "", "generation": generation,
+                "updated_at": now.isoformat(timespec="seconds"),
+            }
+            return
+        changed = prior.get("side") != action["side"] or prior.get("fingerprint") != action["fingerprint"]
+        if changed:
+            generation += 1
+        action["generation"] = generation
+        action["notification_fingerprint"] = _notification_fingerprint(action)
+        next_states[code] = {
+            "side": action["side"], "fingerprint": action["fingerprint"], "generation": generation,
+            "updated_at": now.isoformat(timespec="seconds"),
+        }
+
+    if sells:
+        for review in reviews:
+            code = str(review["holding"].get("code", ""))
+            if code in unavailable:
+                continue
+            evaluated.add(code)
+            update_signal_state(code, next((item for item in actions if item["code"] == code and item["side"] == "sell"), None))
+    else:
+        for code, stock in universe.items():
+            if hhmm_to_minutes(str(stock.get("last_time", ""))) < hhmm_to_minutes(cutoff):
+                continue
+            evaluated.add(code)
+            update_signal_state(code, next((item for item in actions if item["code"] == code and item["side"] == "buy"), None))
+        for review in reviews:
+            code = str(review["holding"].get("code", ""))
+            if code in unavailable:
+                continue
+            evaluated.add(code)
+            update_signal_state(code, None)
+    for action in actions:
+        if action["code"] not in evaluated:
+            evaluated.add(action["code"])
+            update_signal_state(action["code"], action)
+
+    changed_actions = [
+        action for action in actions
+        if previous.get(action["code"], {}).get("side") != action["side"]
+        or previous.get(action["code"], {}).get("fingerprint") != action["fingerprint"]
+    ]
+    batch_fingerprint = hashlib.sha256(
+        "|".join(item["notification_fingerprint"] for item in changed_actions).encode("ascii")
+    ).hexdigest() if changed_actions else ""
+    event_id = f"{trade_date}:scan:{cutoff}:{batch_fingerprint[:12]}" if batch_fingerprint else ""
+    report = {
+        "report_type": "intraday-scan", "stage": "intraday-scan", "label": "盘中信号状态变化",
+        "event_id": event_id, "analysis": analysis, "decision_at": now.isoformat(timespec="seconds"),
+        "scan_time": cutoff, "actions": changed_actions,
+        "holding_reviews": [
+            {
+                "holding": item["holding"], "decision": "sell", "current_price": item["price"],
+                "holding_session": item.get("holding_session", 0), "reasons": item.get("reasons", []),
+            }
+            for item in changed_actions if item["side"] == "sell"
+        ],
+        "buys": [item["stock"] for item in changed_actions if item["side"] == "buy"],
+        "trade_actions": len(changed_actions), "signal_states": next_states,
+    }
+    return report, next_states, evaluated
+
+
+def format_intraday_scan_message(report: dict[str, Any]) -> str:
+    analysis = report["analysis"]
+    lines = [
+        f"**{analysis.get('trade_date', '')} 盘中信号变化**",
+        f">决策时间：{report.get('decision_at', '')} · 市场：{analysis.get('market', {}).get('label', '未核验')}",
+        ">持仓口径：仅基于本地假定持仓，不代表券商真实持仓。",
+        "",
+    ]
+    for action in report.get("actions", []):
+        side = "卖出" if action["side"] == "sell" else "买入"
+        lines.extend([
+            f"**{side} · {action.get('name', '')} {action.get('code', '')}**",
+            f">side：{action['side']} · 参考价：{action.get('price', '未核验')}" + (f" · 区间：{action.get('entry_range')}" if action["side"] == "buy" else ""),
+            f">数量：{action.get('shares', 0)} 股 · 规则：{action.get('reason_code', '')}",
+            f">稳定原因：{'；'.join(action.get('reasons', []))}",
+            ">T+1：当日买入不可卖；卖出仅针对本地假定持仓。" if action["side"] == "sell" else ">T+1：买入后当日不可卖出，下一交易日起复核。",
+            "",
+        ])
+    lines.append("仅供研究参考，不构成个性化投资建议。")
+    return "\n".join(lines)[:3800]
+
+
+def _pending_integrity_hash(pending: dict[str, Any]) -> str:
+    payload = {key: value for key, value in pending.items() if key != "integrity_hash"}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_execution_rows(report: dict[str, Any]) -> dict[str, Any]:
+    source = report.get("analysis", {}).get("execution_evidence_source")
+    if not isinstance(source, dict):
+        raise CorruptLocalData("pending analysis execution evidence source 无效")
+    decision_minute = (
+        report.get("scan_time")
+        if report.get("stage") == "intraday-scan"
+        else report.get("analysis", {}).get("market_data_time", "")
+    )
+    cutoff = str(decision_minute).replace(":", "")
+    if len(cutoff) != 4 or not cutoff.isdigit():
+        raise CorruptLocalData("pending execution evidence decision minute 无效")
+    minutes = int(cutoff[:2]) * 60 + int(cutoff[2:]) + 1
+    expected = f"{minutes // 60:02d}{minutes % 60:02d}"
+    codes = {
+        str(item.get("code", "")) for item in report.get("buys", [])
+        if isinstance(item, dict) and item.get("code")
+    }
+    codes.update(
+        str(item.get("holding", {}).get("code", ""))
+        for item in report.get("holding_reviews", [])
+        if isinstance(item, dict) and item.get("decision") == "sell"
+        and isinstance(item.get("holding"), dict) and item["holding"].get("code")
+    )
+    canonical: dict[str, Any] = {}
+    for code in sorted(codes):
+        symbol = symbol_for(code)
+        node = source.get(symbol)
+        if not isinstance(node, dict) or not isinstance(node.get("records"), list):
+            canonical[symbol] = {"records": []}
+            continue
+        records = []
+        for row in node["records"]:
+            if not isinstance(row, dict) or str(row.get("time", "")).replace(":", "") != expected:
+                continue
+            records.append({
+                key: row.get(key)
+                for key in ("time", "price", "volume", "suspended", "at_limit")
+                if key in row
+            })
+        canonical[symbol] = {"records": records}
+    return canonical
+
+
+def _build_pending(
+    report: dict[str, Any], token: str, message: str, prepared_at: str,
+    test_message: bool, execution_rows: dict[str, Any], kind: str,
+) -> dict[str, Any]:
+    report = copy.deepcopy(report)
+    report.setdefault("analysis", {})["execution_evidence_source"] = copy.deepcopy(execution_rows)
+    pending = {
+        "schema": PENDING_SCHEMA, "kind": kind, "event_id": report["event_id"],
+        "commit_token": token, "prepared_at": prepared_at, "test_message": test_message,
+        "message": message, "report": report,
+    }
+    pending["execution_rows"] = _canonical_execution_rows(report)
+    pending["integrity_hash"] = _pending_integrity_hash(pending)
+    return pending
+
+
+def _validate_pending_payload(pending: Any) -> dict[str, Any]:
+    if not isinstance(pending, dict):
+        raise CorruptLocalData("pending 数据格式无效")
+    required_types = {
+        "schema": str, "kind": str, "event_id": str, "commit_token": str,
+        "prepared_at": str, "test_message": bool, "message": str, "report": dict,
+        "execution_rows": dict, "integrity_hash": str,
+    }
+    for key, expected_type in required_types.items():
+        if not isinstance(pending.get(key), expected_type):
+            raise CorruptLocalData(f"pending 字段 {key} 格式无效")
+    if pending["schema"] != PENDING_SCHEMA or pending["kind"] not in {"scheduled", "intraday-scan"}:
+        raise CorruptLocalData("pending schema 或 kind 无效")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", pending["commit_token"]):
+        raise CorruptLocalData("pending commit_token 格式无效")
+    if not pending["message"].strip() or not pending["prepared_at"].strip():
+        raise CorruptLocalData("pending message 或 prepared_at 为空")
+    report = pending["report"]
+    if report.get("event_id") != pending["event_id"] or not isinstance(report.get("stage"), str):
+        raise CorruptLocalData("pending report identity 无效")
+    if pending["kind"] == "intraday-scan":
+        if pending["test_message"] is not False or report.get("stage") != "intraday-scan":
+            raise CorruptLocalData("盘中 pending kind/test/stage 无效")
+        actions = report.get("actions")
+        states = report.get("signal_states")
+        if not isinstance(actions, list) or not actions or not isinstance(states, dict):
+            raise CorruptLocalData("盘中 pending actions/signal_states 无效")
+        identities = []
+        for action in actions:
+            if not isinstance(action, dict) or action.get("side") not in {"buy", "sell"}:
+                raise CorruptLocalData("盘中 pending action 格式无效")
+            code = action.get("code")
+            generation = action.get("generation")
+            if not isinstance(code, str) or not code or not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+                raise CorruptLocalData("盘中 pending action identity 无效")
+            expected_signal = _signal_fingerprint(
+                str(report.get("analysis", {}).get("trade_date", "")), code, action["side"],
+                str(action.get("holding_id", "")) if action["side"] == "sell" else "",
+            )
+            if action.get("fingerprint") != expected_signal or action.get("notification_fingerprint") != _notification_fingerprint(action):
+                raise CorruptLocalData("盘中 pending action fingerprint 无效")
+            signal_state = states.get(code)
+            if not isinstance(signal_state, dict) or signal_state.get("side") != action["side"] or signal_state.get("fingerprint") != expected_signal or signal_state.get("generation") != generation:
+                raise CorruptLocalData("盘中 pending signal state identity 无效")
+            identities.append(action["notification_fingerprint"])
+        if actions != sorted(actions, key=lambda item: (0 if item["side"] == "sell" else 1, item["code"], item.get("holding_id", ""))):
+            raise CorruptLocalData("盘中 pending action 排序无效")
+        batch = hashlib.sha256("|".join(identities).encode("ascii")).hexdigest()[:12]
+        trade_date = str(report.get("analysis", {}).get("trade_date", ""))
+        scan_time = report.get("scan_time")
+        if pending["event_id"] != f"{trade_date}:scan:{scan_time}:{batch}":
+            raise CorruptLocalData("盘中 pending event identity 无效")
+    elif report.get("stage") not in SCHEDULED_STAGES or pending["event_id"] != f"{report.get('analysis', {}).get('trade_date')}:{report.get('stage')}":
+        raise CorruptLocalData("定时 pending event identity 无效")
+    if not secrets.compare_digest(pending["integrity_hash"], _pending_integrity_hash(pending)):
+        raise CorruptLocalData("pending integrity hash 无效")
+    return pending
+
+
+def _validate_pending(pending: Any, state: dict[str, Any]) -> dict[str, Any]:
+    validated = _validate_pending_payload(pending)
+    report = validated["report"]
+    if report.get("stage") == "intraday-scan":
+        if not isinstance(report.get("decision_at"), str):
+            raise CorruptLocalData("盘中 pending decision_at 无效")
+        expected, _, _ = build_intraday_scan_report(
+            report.get("analysis", {}), state, datetime.fromisoformat(report["decision_at"]),
+        )
+        if expected.get("event_id") != report.get("event_id") or expected.get("actions") != report.get("actions") or expected.get("signal_states") != report.get("signal_states"):
+            raise CorruptLocalData("盘中 pending report 无法从 analysis/state 重算")
+    else:
+        expected = build_scheduled_report(report["stage"], report.get("analysis", {}), state)
+        if expected != report:
+            raise CorruptLocalData("定时 pending report 无法从 analysis/state 重算")
+    expected_message = (
+        format_intraday_scan_message(expected)
+        if validated["kind"] == "intraday-scan"
+        else format_lightclaw_message(expected, test=validated["test_message"])
+    )
+    if validated["message"].encode("utf-8") != expected_message.encode("utf-8"):
+        raise CorruptLocalData("pending message 无法从 report 重建")
+    if validated["execution_rows"] != _canonical_execution_rows(expected):
+        raise CorruptLocalData("pending execution evidence 无法从 analysis 重建")
+    return validated
+
+
+def lightclaw_scan_prepare(
+    now: datetime | None = None, state_path: Path | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(SHANGHAI)
+    allowed, reason = scan_window_status(now)
+    if not allowed:
+        return {"status": "no_signal", "reason": reason, "decision_at": now.isoformat(timespec="seconds")}
+    today = now.strftime("%Y%m%d")
+    batch_prefix = f"{today}:scan:{now:%H%M}:"
+    with trading_state_transaction(state_path) as locked_path:
+        state = load_trading_state(locked_path)
+        pending = state.get("pending_report")
+        if pending is not None:
+            pending = _validate_pending(pending, state)
+            if str(pending.get("event_id", "")).startswith(batch_prefix):
+                return {
+                    "status": "already_pending", "event_id": pending.get("event_id", ""),
+                    "commit_token": pending.get("commit_token", ""), "message": pending.get("message", ""),
+                }
+            return {
+                "status": "conflict", "reason": "存在其他未送达 pending，禁止覆盖",
+                "pending_event_id": pending.get("event_id", ""),
+            }
+        persistence_data: dict[str, Any] = {}
+        cutoff = now.hour * 60 + now.minute
+        analysis = run_analysis(
+            now=now, cutoff_minutes=cutoff, persist=False, persistence_data=persistence_data,
+            mode="intraday-scan",
+        )
+        if analysis.get("trade_date") != today:
+            return {
+                "status": "no_signal", "reason": "无已确认的当日交易行情，可能休市或行情陈旧",
+                "trade_date": analysis.get("trade_date", ""),
+            }
+        if hhmm_to_minutes(str(analysis.get("market_data_time", ""))) < cutoff:
+            return {
+                "status": "no_signal", "reason": "整体行情尚未达到本轮截点，未更新信号状态",
+                "market_data_time": analysis.get("market_data_time", ""), "required_time": minutes_to_hhmm(cutoff),
+            }
+        report, next_states, evaluated = build_intraday_scan_report(analysis, state, now)
+        if not report["actions"]:
+            if state.get("signal_trade_date") != today or next_states != state.get("signal_states", {}):
+                state["signal_trade_date"] = today
+                state["signal_states"] = next_states
+                state["updated_at"] = now.isoformat(timespec="seconds")
+                save_trading_state(state, locked_path)
+            return {
+                "status": "no_signal", "reason": "信号状态未变化",
+                "trade_date": today, "evaluated_symbols": len(evaluated),
+            }
+        token = secrets.token_urlsafe(32)
+        message = format_intraday_scan_message(report)
+        state["pending_report"] = _build_pending(
+            report, token, message, now.isoformat(timespec="seconds"), False,
+            persistence_data.get("execution_rows", {}), "intraday-scan",
+        )
+        save_trading_state(state, locked_path)
+    return {
+        "status": "prepared", "event_id": report["event_id"], "commit_token": token,
+        "message": message, "trade_actions": len(report["actions"]),
+    }
 
 
 def lightclaw_prepare(
@@ -1395,11 +1837,13 @@ def lightclaw_prepare(
     event_id = f"{today}:{stage}"
     with trading_state_transaction(state_path) as locked_path:
         state = load_trading_state(locked_path)
+        pending = state.get("pending_report")
+        if pending is not None:
+            pending = _validate_pending(pending, state)
         if event_id in state.get("processed_events", []):
             return {"status": "already_committed", "event_id": event_id}
-        pending = state.get("pending_report")
-        if pending:
-            pending_test_message = bool(pending.get("test_message", False))
+        if pending is not None:
+            pending_test_message = pending["test_message"]
             if pending.get("event_id") != event_id or pending_test_message != test_message:
                 return {
                     "status": "pending_conflict",
@@ -1439,15 +1883,10 @@ def lightclaw_prepare(
         report = build_scheduled_report(stage, analysis, state)
         message = format_lightclaw_message(report, test=test_message)
         token = secrets.token_urlsafe(32)
-        state["pending_report"] = {
-            "event_id": event_id,
-            "commit_token": token,
-            "prepared_at": now.isoformat(timespec="seconds"),
-            "test_message": test_message,
-            "message": message,
-            "report": report,
-            "execution_rows": persistence_data.get("execution_rows", {}),
-        }
+        state["pending_report"] = _build_pending(
+            report, token, message, now.isoformat(timespec="seconds"), test_message,
+            persistence_data.get("execution_rows", {}), "scheduled",
+        )
         save_trading_state(state, locked_path)
     return {
         "status": "prepared",
@@ -1469,6 +1908,9 @@ def lightclaw_commit(
     now = now or datetime.now(SHANGHAI)
     with trading_state_transaction(state_path) as locked_path:
         state = load_trading_state(locked_path)
+        pending = state.get("pending_report")
+        if pending is not None:
+            pending = _validate_pending(pending, state)
         committed_tokens = state.get("committed_delivery_tokens", {})
         if commit_token in committed_tokens:
             event_id = committed_tokens[commit_token]
@@ -1486,12 +1928,11 @@ def lightclaw_commit(
                 "event_id": event_id,
                 "open_holdings": len(state.get("holdings", [])),
             }
-        pending = state.get("pending_report")
-        if not pending or not secrets.compare_digest(str(pending.get("commit_token", "")), commit_token):
+        if pending is None:
             raise ValueError("commit token 无效或不存在对应 pending")
-        report = pending.get("report")
-        if not isinstance(report, dict) or report.get("event_id") != pending.get("event_id"):
-            raise RuntimeError("pending report 格式无效")
+        if not secrets.compare_digest(pending["commit_token"], commit_token):
+            raise ValueError("commit token 无效或不存在对应 pending")
+        report = pending["report"]
         if report["event_id"] in state.get("processed_events", []):
             updated = copy.deepcopy(state)
         else:
@@ -1525,14 +1966,16 @@ def lightclaw_commit(
 
 
 def scheduled_push_conflict(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    pending = state.get("pending_report")
+    if pending is not None:
+        pending = _validate_pending(pending, state)
     if event_id in state.get("processed_events", []):
         return {
             "sent": False,
             "reason": "该阶段已经成功推送",
             "event_id": event_id,
         }
-    pending = state.get("pending_report")
-    if pending:
+    if pending is not None:
         return {
             "sent": False,
             "reason": "存在未完成的 LightClaw pending，禁止企业微信外发和状态应用",
@@ -1704,6 +2147,11 @@ def main() -> int:
         help="生成 LightClaw 待发送消息并返回 commit token；本入口绝不外发",
     )
     lightclaw_action.add_argument(
+        "--lightclaw-scan-prepare",
+        action="store_true",
+        help="生成盘中状态变化待发送消息；本入口绝不外发",
+    )
+    lightclaw_action.add_argument(
         "--lightclaw-commit",
         metavar="TOKEN",
         help="仅在上层确认飞书送达后提交对应 token",
@@ -1738,15 +2186,21 @@ def main() -> int:
         except Exception as error:
             print(json.dumps({"status": "corrupt_data", "schema": "astock.weekly-review/v1", "errors": [str(error)]}, ensure_ascii=False))
             return 2
-    if args.lightclaw_prepare or args.lightclaw_commit:
+    if args.lightclaw_prepare or args.lightclaw_scan_prepare or args.lightclaw_commit:
         try:
-            result = (
-                lightclaw_prepare(args.lightclaw_prepare, test_message=args.lightclaw_test_message)
-                if args.lightclaw_prepare
-                else lightclaw_commit(args.lightclaw_commit)
-            )
+            if args.lightclaw_prepare:
+                result = lightclaw_prepare(args.lightclaw_prepare, test_message=args.lightclaw_test_message)
+            elif args.lightclaw_scan_prepare:
+                if args.lightclaw_test_message:
+                    raise ValueError("盘中正式扫描不支持测试消息模式")
+                result = lightclaw_scan_prepare()
+            else:
+                result = lightclaw_commit(args.lightclaw_commit)
             print(json.dumps(result, ensure_ascii=False))
-            return 3 if result.get("status") == "pending_conflict" else 0
+            return 3 if result.get("status") in {"pending_conflict", "conflict"} else 0
+        except CorruptLocalData as error:
+            print(json.dumps({"status": "corrupt_data", "error": str(error)}, ensure_ascii=False))
+            return 2
         except Exception as error:
             print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
             return 1
@@ -1760,6 +2214,9 @@ def main() -> int:
             result = scheduled_push(stage, webhook)
             print(json.dumps(result, ensure_ascii=False))
             return 0
+        except CorruptLocalData as error:
+            print(json.dumps({"sent": False, "error": str(error)}, ensure_ascii=False))
+            return 2
         except Exception as error:
             print(json.dumps({"sent": False, "error": str(error)}, ensure_ascii=False))
             return 1
