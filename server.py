@@ -82,6 +82,11 @@ _scheduler_stop = threading.Event()
 PUSH_CONFIG_PATH = DATA_DIR / "feishu-push.json"
 TRADING_STATE_PATH = DATA_DIR / "trading-state.json"
 
+# 直接推送目标：邢晓渝个人飞书私信
+DEFAULT_RECEIVE_EMAIL = "xingxiaoyu@pjlab.org.cn"
+FEISHU_OPEN_API_BASE = "https://open.feishu.cn/open-apis"
+_token_cache: dict[str, Any] = {"token": "", "expires": 0.0}
+
 SCHEDULED_STAGES = {
     "morning-summary": {
         "cutoff": 10 * 60,
@@ -161,11 +166,75 @@ def validate_feishu_webhook(webhook: str) -> str:
     return webhook
 
 
+def get_tenant_access_token(app_id: str, app_secret: str) -> str:
+    """获取飞书自建应用 tenant_access_token，带进程内缓存。"""
+    app_id = app_id.strip()
+    app_secret = app_secret.strip()
+    if not app_id or not app_secret:
+        raise ValueError("缺少飞书应用 app_id 或 app_secret")
+    now = time.time()
+    cached = _token_cache.get("token", "")
+    if cached and now < _token_cache.get("expires", 0.0) - 120:
+        return cached
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{FEISHU_OPEN_API_BASE}/auth/v3/tenant_access_token/internal",
+        data=body,
+        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if result.get("code") != 0:
+        raise RuntimeError(f"获取飞书 tenant_access_token 失败：{result.get('msg', 'unknown')}")
+    token = str(result.get("tenant_access_token", ""))
+    if not token:
+        raise RuntimeError("飞书返回的 tenant_access_token 为空")
+    _token_cache["token"] = token
+    _token_cache["expires"] = now + int(result.get("expire", 7200))
+    return token
+
+
+def send_feishu_direct(
+    message_text: str,
+    app_id: str,
+    app_secret: str,
+    receive_id: str = DEFAULT_RECEIVE_EMAIL,
+    receive_id_type: str = "email",
+) -> dict[str, Any]:
+    """通过飞书自建应用直接给个人发私信（默认发给邢晓渝）。"""
+    token = get_tenant_access_token(app_id, app_secret)
+    receive_id = receive_id.strip() or DEFAULT_RECEIVE_EMAIL
+    content = json.dumps({"text": message_text}, ensure_ascii=False)
+    body = json.dumps(
+        {"receive_id": receive_id, "msg_type": "text", "content": content},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if len(body) > 50_000:
+        raise ValueError("飞书私信消息超过 50 KB 限制")
+    request = urllib.request.Request(
+        f"{FEISHU_OPEN_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}",
+        data=body,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if result.get("code") != 0:
+        raise RuntimeError(f"飞书私信发送失败：{result.get('msg', 'unknown')}")
+    return result
+
+
 def load_push_config(include_secret: bool = False) -> dict[str, Any]:
     with _push_lock:
         if not PUSH_CONFIG_PATH.exists():
             config = {
                 "enabled": False, "webhook": "", "signing_secret": "",
+                "app_id": "", "app_secret": "", "receive_id": "",
                 "last_sent": "", "last_result": "尚未配置",
             }
         else:
@@ -174,20 +243,26 @@ def load_push_config(include_secret: bool = False) -> dict[str, Any]:
             except (OSError, json.JSONDecodeError):
                 config = {
                     "enabled": False, "webhook": "", "signing_secret": "",
+                    "app_id": "", "app_secret": "", "receive_id": "",
                     "last_sent": "", "last_result": "配置文件损坏",
                 }
+    has_app = bool(config.get("app_id") and config.get("app_secret"))
     status = {
-        "configured": bool(config.get("webhook")),
+        "configured": bool(config.get("webhook")) or has_app,
         "signed": bool(config.get("signing_secret")),
         "enabled": bool(config.get("enabled")),
         "last_sent": str(config.get("last_sent", "")),
         "last_result": str(config.get("last_result", "")),
         "schedule": "交易日 10:00 / 10:30 / 14:30 / 15:30",
-        "channel": "飞书群自定义机器人",
+        "channel": "飞书私信（邢晓渝）" if has_app else "飞书群自定义机器人",
+        "has_app": has_app,
     }
     if include_secret:
         status["webhook"] = str(config.get("webhook", ""))
         status["signing_secret"] = str(config.get("signing_secret", ""))
+        status["app_id"] = str(config.get("app_id", ""))
+        status["app_secret"] = str(config.get("app_secret", ""))
+        status["receive_id"] = str(config.get("receive_id", ""))
     return status
 
 
@@ -198,10 +273,14 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
         current["webhook"] = validate_feishu_webhook(webhook)
     if "signing_secret" in update and str(update["signing_secret"]).strip():
         current["signing_secret"] = str(update["signing_secret"]).strip()
+    for key in ("app_id", "app_secret", "receive_id"):
+        if key in update:
+            current[key] = str(update[key]).strip()
     if "enabled" in update:
         current["enabled"] = bool(update["enabled"])
-    if current.get("enabled") and not current.get("webhook"):
-        raise ValueError("启用自动推送前必须配置 Webhook")
+    has_app = bool(current.get("app_id") and current.get("app_secret"))
+    if current.get("enabled") and not current.get("webhook") and not has_app:
+        raise ValueError("启用自动推送前必须配置飞书应用凭据或 Webhook")
     for key in ("last_sent", "last_result"):
         if key in update:
             current[key] = str(update[key])
@@ -211,6 +290,9 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
         "last_sent": current.get("last_sent", ""),
         "last_result": current.get("last_result", ""),
         "signing_secret": current.get("signing_secret", ""),
+        "app_id": current.get("app_id", ""),
+        "app_secret": current.get("app_secret", ""),
+        "receive_id": current.get("receive_id", ""),
     }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     temporary = PUSH_CONFIG_PATH.with_suffix(".tmp")
@@ -472,12 +554,14 @@ def format_lightclaw_message(report: dict[str, Any], test: bool = False) -> str:
 def send_feishu_push(
     payload: dict[str, Any], test: bool = False, webhook: str | None = None,
     signing_secret: str | None = None,
+    app_id: str | None = None, app_secret: str | None = None,
+    receive_id: str | None = None,
 ) -> dict[str, Any]:
     config = load_push_config(include_secret=True)
-    webhook = webhook or config.get("webhook", "")
-    if not webhook:
-        raise RuntimeError("尚未配置飞书机器人 Webhook")
-    webhook = validate_feishu_webhook(webhook)
+    # 优先走自建应用私信通道（直接发给邢晓渝个人）
+    app_id = (app_id or config.get("app_id") or os.environ.get("FEISHU_APP_ID", "")).strip()
+    app_secret = (app_secret or config.get("app_secret") or os.environ.get("FEISHU_APP_SECRET", "")).strip()
+    receive_id = (receive_id or config.get("receive_id") or os.environ.get("FEISHU_RECEIVE_ID", "")).strip()
     markdown_message = (
         format_scheduled_message(payload, test=test)
         if payload.get("report_type") == "scheduled"
@@ -486,6 +570,16 @@ def send_feishu_push(
     message = re.sub(r"^>\s?", "", markdown_message, flags=re.MULTILINE)
     message = re.sub(r"\*\*(.*?)\*\*", r"\1", message)
     message = re.sub(r"`([^`]*)`", r"\1", message)
+    if app_id and app_secret:
+        return send_feishu_direct(
+            message, app_id=app_id, app_secret=app_secret,
+            receive_id=receive_id or DEFAULT_RECEIVE_EMAIL,
+        )
+    # 兼容旧通道：群自定义机器人 Webhook
+    webhook = webhook or config.get("webhook", "")
+    if not webhook:
+        raise RuntimeError("尚未配置飞书应用凭据（FEISHU_APP_ID/APP_SECRET）或群 Webhook")
+    webhook = validate_feishu_webhook(webhook)
     body_data: dict[str, Any] = {"msg_type": "text", "content": {"text": message}}
     signing_secret = signing_secret if signing_secret is not None else config.get("signing_secret", "")
     if signing_secret:
@@ -2104,13 +2198,17 @@ def scheduled_push_conflict(state: dict[str, Any], event_id: str) -> dict[str, A
 
 def scheduled_push(
     stage: str,
-    webhook: str,
+    webhook: str = "",
     now: datetime | None = None,
     state_path: Path | None = None,
     signing_secret: str | None = None,
+    app_id: str | None = None,
+    app_secret: str | None = None,
+    receive_id: str | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
-    webhook = validate_feishu_webhook(webhook)
+    if webhook:
+        webhook = validate_feishu_webhook(webhook)
     manual_holdings = load_manual_holdings()
     if stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
@@ -2146,7 +2244,10 @@ def scheduled_push(
         minute_rows = persistence_data.get("minute_rows")
         if minute_rows is not None:
             persist_decision(analysis, minute_rows)
-        send_feishu_push(report, webhook=webhook, signing_secret=signing_secret)
+        send_feishu_push(
+            report, webhook=webhook or None, signing_secret=signing_secret,
+            app_id=app_id, app_secret=app_secret, receive_id=receive_id,
+        )
         updated = apply_scheduled_report(state, report, now)
         save_trading_state(updated, locked_path)
     return {
@@ -2158,7 +2259,7 @@ def scheduled_push(
     }
 
 
-def push_once(webhook: str, now: datetime | None = None) -> dict[str, Any]:
+def push_once(webhook: str = "", now: datetime | None = None) -> dict[str, Any]:
     """Backward-compatible alias for the 14:30 scheduled decision."""
     return scheduled_push("tail-decision", webhook, now=now)
 
@@ -2177,12 +2278,16 @@ def push_scheduler_loop() -> None:
             continue
         config = load_push_config(include_secret=True)
         event_id = f"{now:%Y%m%d}:{stage}"
-        if not config.get("enabled") or not config.get("webhook") or config.get("last_sent") == event_id:
+        has_app = bool(config.get("app_id") and config.get("app_secret"))
+        has_webhook = bool(config.get("webhook"))
+        if not config.get("enabled") or (not has_app and not has_webhook) or config.get("last_sent") == event_id:
             continue
         try:
             result = scheduled_push(
-                stage, config["webhook"], now=now,
+                stage, config.get("webhook", ""), now=now,
                 signing_secret=config.get("signing_secret", ""),
+                app_id=config.get("app_id", ""), app_secret=config.get("app_secret", ""),
+                receive_id=config.get("receive_id", ""),
             )
             status = "推送成功" if result.get("sent") else f"跳过：{result.get('reason', '无需推送')}"
             save_push_config({"last_sent": event_id, "last_result": f"{now:%Y-%m-%d %H:%M} {status}"})
@@ -2326,14 +2431,22 @@ def main() -> int:
             print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
             return 1
     if args.push_once or args.scheduled_push:
+        app_id = os.environ.get("FEISHU_APP_ID", "").strip()
+        app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+        receive_id = os.environ.get("FEISHU_RECEIVE_ID", "").strip()
         webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
-        if not webhook:
-            print(json.dumps({"sent": False, "error": "缺少 FEISHU_WEBHOOK"}, ensure_ascii=False))
+        if not (app_id and app_secret) and not webhook:
+            print(json.dumps(
+                {"sent": False, "error": "缺少 FEISHU_APP_ID/FEISHU_APP_SECRET 或 FEISHU_WEBHOOK"},
+                ensure_ascii=False,
+            ))
             return 2
         try:
             stage = args.scheduled_push or "tail-decision"
             result = scheduled_push(
-                stage, webhook, signing_secret=os.environ.get("FEISHU_SIGNING_SECRET", ""),
+                stage, webhook,
+                signing_secret=os.environ.get("FEISHU_SIGNING_SECRET", ""),
+                app_id=app_id, app_secret=app_secret, receive_id=receive_id,
             )
             print(json.dumps(result, ensure_ascii=False))
             return 0
