@@ -25,7 +25,8 @@ python3 -B server.py --host 127.0.0.1 --port 8765
 1. 打开 `Settings` -> `Secrets and variables` -> `Actions`。
 2. 新建 Repository secret，名称为 `WECOM_WEBHOOK`。
 3. 值填写企业微信“消息推送”生成的完整官方 Webhook。
-4. 打开 `Actions` -> `Daily A-share push`；定时任务只运行收盘总结，`Run workflow` 仍可手工选择兼容阶段。
+4. 如需在收盘总结中跟踪人工登记的持仓，另建 Repository secret `ASTOCK_MANUAL_HOLDINGS`，值为 JSON 数组，例如 `[{"code":"000001","shares":100,"buy_price":10.00,"buy_date":"2026-01-05"}]`。该持仓只报告收盘价和浮动盈亏，不进入策略自动买卖决策。
+5. 打开 `Actions` -> `Daily A-share push`；定时任务只运行收盘总结，`Run workflow` 仍可手工选择兼容阶段。
 
 Webhook 不得写入代码、工作流文件、提交记录或聊天消息。已经泄露的 Webhook 应先在企业微信中删除并重新创建。
 

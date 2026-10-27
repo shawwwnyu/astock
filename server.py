@@ -378,6 +378,21 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
             lines.append("10:00 仅报告早盘情况，10:30 再给持仓和交易决定。")
         else:
             lines.append("收盘总结使用截至15:00的行情，本条不产生交易操作。")
+            for holding in report.get("manual_holding_reviews", []):
+                current_price = holding.get("current_price")
+                lines.extend([
+                    "",
+                    f"**持仓监控 · {holding.get('name', '')} {holding.get('code', '')}**",
+                    f">买入日：{holding.get('buy_date', '')} · 成本：{holding.get('buy_price', 0):.3f} · 数量：{holding.get('shares', 0)} 股",
+                ])
+                if current_price is None:
+                    lines.append(">收盘行情缺失，浮动盈亏无法计算。")
+                else:
+                    lines.extend([
+                        f">收盘价：{current_price:.3f} · 浮动盈亏：{holding['floating_pnl']:+.2f} 元（{percent_text(holding['return_pct'])}）",
+                    ])
+            if report.get("manual_holding_reviews"):
+                lines.append(">此处仅汇报价格与浮动盈亏，不生成该持仓的买卖指令。")
     else:
         reviews = report.get("holding_reviews", [])
         buys = report.get("buys", [])
@@ -1169,6 +1184,73 @@ def stock_lookup(analysis: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def load_manual_holdings(raw: str | None = None) -> list[dict[str, Any]]:
+    raw = os.environ.get("ASTOCK_MANUAL_HOLDINGS", "") if raw is None else raw
+    if not raw.strip():
+        return []
+    try:
+        holdings = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"ASTOCK_MANUAL_HOLDINGS 必须是 JSON 数组：{error}") from error
+    if not isinstance(holdings, list):
+        raise ValueError("ASTOCK_MANUAL_HOLDINGS 必须是 JSON 数组")
+    normalized = []
+    seen_codes = set()
+    for holding in holdings:
+        if not isinstance(holding, dict) or set(holding) != {"code", "shares", "buy_price", "buy_date"}:
+            raise ValueError("每笔人工持仓必须且只能包含 code、shares、buy_price、buy_date")
+        code = str(holding["code"])
+        shares = holding["shares"]
+        buy_price = as_number(holding["buy_price"])
+        buy_date = str(holding["buy_date"])
+        try:
+            parsed_date = datetime.strptime(buy_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("人工持仓 buy_date 必须使用 YYYY-MM-DD 日期") from error
+        if (
+            len(code) != 6 or not code.isdigit()
+            or code in seen_codes
+            or not isinstance(shares, int) or isinstance(shares, bool) or shares <= 0
+            or buy_price is None or buy_price <= 0
+            or parsed_date.strftime("%Y-%m-%d") != buy_date
+        ):
+            raise ValueError("人工持仓的股票代码、数量、成本或买入日期无效")
+        seen_codes.add(code)
+        normalized.append({
+            "code": code,
+            "shares": shares,
+            "buy_price": buy_price,
+            "buy_date": buy_date,
+        })
+    return normalized
+
+
+def review_manual_holdings(
+    holdings: list[dict[str, Any]], analysis: dict[str, Any],
+) -> list[dict[str, Any]]:
+    stocks = stock_lookup(analysis)
+    reviews = []
+    for holding in holdings:
+        stock = stocks.get(holding["code"], {})
+        current_price = as_number(stock.get("price"))
+        floating_pnl = (
+            round((current_price - holding["buy_price"]) * holding["shares"], 2)
+            if current_price is not None else None
+        )
+        return_pct = (
+            round((current_price / holding["buy_price"] - 1) * 100, 2)
+            if current_price is not None else None
+        )
+        reviews.append({
+            **holding,
+            "name": str(stock.get("name") or holding["code"]),
+            "current_price": current_price,
+            "floating_pnl": floating_pnl,
+            "return_pct": return_pct,
+        })
+    return reviews
+
+
 def holding_session_number(holding: dict[str, Any], analysis: dict[str, Any]) -> int:
     buy_date = str(holding.get("buy_date", "")).replace("-", "")
     trade_date = str(analysis.get("trade_date", "")).replace("-", "")
@@ -1248,6 +1330,7 @@ def build_scheduled_report(
     stage: str,
     analysis: dict[str, Any],
     state: dict[str, Any],
+    manual_holdings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
@@ -1281,6 +1364,10 @@ def build_scheduled_report(
         "event_id": f"{analysis.get('trade_date', '')}:{stage}",
         "analysis": analysis,
         "holding_reviews": reviews,
+        "manual_holding_reviews": (
+            review_manual_holdings(manual_holdings or [], analysis)
+            if stage == "close-summary" else []
+        ),
         "buys": buys,
         "notes": notes,
     }
@@ -1994,6 +2081,7 @@ def scheduled_push(
 ) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
     webhook = validate_wecom_webhook(webhook)
+    manual_holdings = load_manual_holdings()
     if stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
     today = now.strftime("%Y%m%d")
@@ -2024,7 +2112,7 @@ def scheduled_push(
         conflict = scheduled_push_conflict(state, event_id)
         if conflict:
             return conflict
-        report = build_scheduled_report(stage, analysis, state)
+        report = build_scheduled_report(stage, analysis, state, manual_holdings)
         minute_rows = persistence_data.get("minute_rows")
         if minute_rows is not None:
             persist_decision(analysis, minute_rows)

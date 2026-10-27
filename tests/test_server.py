@@ -89,6 +89,47 @@ class DashboardLogicTests(unittest.TestCase):
         self.assertEqual(server.SCHEDULED_STAGES["tail-decision"]["cutoff"], 14 * 60 + 30)
         self.assertEqual(server.SCHEDULED_STAGES["close-summary"]["cutoff"], 15 * 60)
 
+    def test_manual_holdings_are_validated_and_reviewed_only_for_close_summary(self):
+        manual_holdings = server.load_manual_holdings(
+            '[{"code":"000001","shares":100,"buy_price":10.0,"buy_date":"2026-01-05"}]'
+        )
+        analysis = self.analysis(
+            trade_date="20260106",
+            universe=[{"code": "000001", "name": "测试股份", "price": 11.0}],
+        )
+        report = server.build_scheduled_report(
+            "close-summary", analysis, server.empty_trading_state(), manual_holdings,
+        )
+        holding = report["manual_holding_reviews"][0]
+        self.assertEqual(holding["name"], "测试股份")
+        self.assertEqual(holding["floating_pnl"], 100.0)
+        self.assertEqual(holding["return_pct"], 10.0)
+        self.assertEqual(report["trade_actions"], 0)
+        self.assertEqual(report["buys"], [])
+        self.assertEqual(report["holding_reviews"], [])
+        message = server.format_scheduled_message(report)
+        self.assertIn("持仓监控 · 测试股份 000001", message)
+        self.assertIn("浮动盈亏：+100.00 元", message)
+        self.assertIn("不生成该持仓的买卖指令", message)
+        self.assertEqual(
+            server.build_scheduled_report(
+                "morning-summary", analysis, server.empty_trading_state(), manual_holdings,
+            )["manual_holding_reviews"],
+            [],
+        )
+
+    def test_manual_holdings_reject_invalid_or_duplicate_entries(self):
+        for raw in (
+            "not-json",
+            '{"code":"000001"}',
+            '[{"code":"000001","shares":0,"buy_price":10,"buy_date":"2026-01-05"}]',
+            '[{"code":"000001","shares":100,"buy_price":10,"buy_date":"2026-02-30"}]',
+            '[{"code":"000001","shares":100,"buy_price":10,"buy_date":"2026-01-05"},'
+            '{"code":"000001","shares":100,"buy_price":10,"buy_date":"2026-01-05"}]',
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                server.load_manual_holdings(raw)
+
     def test_minute_cutoff_and_vwap(self):
         quote = [""] * 6
         quote[1] = "测试股票"
