@@ -647,11 +647,11 @@ class WeeklyReviewTests(unittest.TestCase):
             state_path = Path(directory) / "state.json"
             state_path.write_text("unchanged", encoding="utf-8")
             output = io.StringIO()
-            environ = {"WECOM_WEBHOOK": "sentinel", "RESOURCE_STATS_FEISHU_WEBHOOK": "sentinel"}
+            environ = {"FEISHU_WEBHOOK": "sentinel", "RESOURCE_STATS_FEISHU_WEBHOOK": "sentinel"}
             with patch.object(sys, "argv", ["server.py", "--weekly-review", "--as-of", "2026-08-22",
                                                     "--weekly-config", str(config_path)]), \
                  patch.dict(os.environ, environ, clear=True), patch("sys.stdout", output), \
-                 patch("urllib.request.urlopen") as network, patch("server.send_wecom_push") as sender:
+                 patch("urllib.request.urlopen") as network, patch("server.send_feishu_push") as sender:
                 code = server.main()
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output.getvalue())["status"], "insufficient_data")

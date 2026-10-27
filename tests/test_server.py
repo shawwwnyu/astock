@@ -12,7 +12,7 @@ import server
 
 
 class DashboardLogicTests(unittest.TestCase):
-    WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=00000000-0000-0000-0000-000000000000"
+    WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/00000000-0000-0000-0000-000000000000"
 
     @staticmethod
     def analysis(
@@ -177,23 +177,61 @@ class DashboardLogicTests(unittest.TestCase):
         ]
         self.assertEqual(server.market_state(rows)["state"], "red")
 
-    def test_wecom_webhook_validation(self):
-        self.assertEqual(server.validate_wecom_webhook(self.WEBHOOK), self.WEBHOOK)
+    def test_feishu_webhook_validation(self):
+        self.assertEqual(server.validate_feishu_webhook(self.WEBHOOK), self.WEBHOOK)
         with self.assertRaises(ValueError):
-            server.validate_wecom_webhook("https://example.com/cgi-bin/webhook/send?key=00000000-0000-0000-0000-000000000000")
+            server.validate_feishu_webhook("https://example.com/open-apis/bot/v2/hook/00000000-0000-0000-0000-000000000000")
+        with self.assertRaises(ValueError):
+            server.validate_feishu_webhook("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=00000000-0000-0000-0000-000000000000")
 
     def test_push_status_never_exposes_webhook(self):
         with TemporaryDirectory() as directory:
             data_dir = Path(directory)
-            config_path = data_dir / "wecom-push.json"
+            config_path = data_dir / "feishu-push.json"
             with patch.object(server, "DATA_DIR", data_dir), patch.object(server, "PUSH_CONFIG_PATH", config_path):
-                status = server.save_push_config({"webhook": self.WEBHOOK, "enabled": True})
+                status = server.save_push_config({
+                    "webhook": self.WEBHOOK,
+                    "signing_secret": "local-signature-secret",
+                    "enabled": True,
+                })
                 self.assertTrue(status["configured"])
+                self.assertTrue(status["signed"])
                 self.assertTrue(status["enabled"])
                 self.assertNotIn("webhook", status)
+                self.assertNotIn("local-signature-secret", str(status))
                 self.assertNotIn("key=", str(status))
 
-    def test_wecom_message_contains_decision_and_candidate(self):
+    def test_feishu_push_sends_text_with_valid_signature(self):
+        analysis = {
+            "trade_date": "20261027",
+            "headline": "行情正常",
+            "market": {"label": "绿灯"},
+            "data_as_of": "2026-10-27 15:00",
+            "candidates": [],
+        }
+        response = io.BytesIO(b'{"code":0,"msg":"success","data":{}}')
+        with patch("server.load_push_config", return_value={"webhook": "", "signing_secret": ""}), \
+                patch("server.time.time", return_value=1_798_000_000), \
+                patch("server.urllib.request.urlopen", return_value=response) as urlopen:
+            result = server.send_feishu_push(
+                analysis, webhook=self.WEBHOOK, signing_secret="signature-secret",
+            )
+        self.assertEqual(result["code"], 0)
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(request.full_url, self.WEBHOOK)
+        self.assertEqual(payload["msg_type"], "text")
+        self.assertIn("行情正常", payload["content"]["text"])
+        self.assertNotIn("**", payload["content"]["text"])
+        string_to_sign = f"{payload['timestamp']}\nsignature-secret"
+        expected = server.base64.b64encode(
+            server.hmac.new(
+                string_to_sign.encode("utf-8"), b"", digestmod=server.hashlib.sha256,
+            ).digest(),
+        ).decode("utf-8")
+        self.assertEqual(payload["sign"], expected)
+
+    def test_push_message_contains_decision_and_candidate(self):
         analysis = {
             "trade_date": "20260728",
             "headline": "没有满足条件的买点，建议空仓",
@@ -210,14 +248,14 @@ class DashboardLogicTests(unittest.TestCase):
                 "failures": ["量价条件不足"],
             }],
         }
-        message = server.format_wecom_message(analysis)
+        message = server.format_push_message(analysis)
         self.assertIn(analysis["headline"], message)
         self.assertIn("测试股份 000001", message)
 
     def test_scheduled_push_skips_stale_market_data(self):
         now = datetime(2026, 7, 29, 14, 30, tzinfo=server.SHANGHAI)
         analysis = self.analysis(trade_date="20260728")
-        with patch("server.run_analysis", return_value=analysis), patch("server.send_wecom_push") as sender:
+        with patch("server.run_analysis", return_value=analysis), patch("server.send_feishu_push") as sender:
             result = server.scheduled_push("tail-decision", self.WEBHOOK, now=now)
         self.assertFalse(result["sent"])
         sender.assert_not_called()
@@ -226,7 +264,7 @@ class DashboardLogicTests(unittest.TestCase):
         now = datetime(2026, 7, 29, 12, 30, tzinfo=server.SHANGHAI)
         analysis = self.analysis()
         analysis["market_data_time"] = "1130"
-        with patch("server.run_analysis", return_value=analysis), patch("server.send_wecom_push") as sender:
+        with patch("server.run_analysis", return_value=analysis), patch("server.send_feishu_push") as sender:
             result = server.scheduled_push("tail-decision", self.WEBHOOK, now=now)
         self.assertFalse(result["sent"])
         self.assertEqual(result["required_time"], "14:30")
@@ -237,7 +275,7 @@ class DashboardLogicTests(unittest.TestCase):
         analysis = self.analysis(candidates=[self.candidate()])
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            with patch("server.run_analysis", return_value=analysis), patch("server.send_wecom_push") as sender:
+            with patch("server.run_analysis", return_value=analysis), patch("server.send_feishu_push") as sender:
                 result = server.scheduled_push(
                     "tail-decision", self.WEBHOOK, now=now, state_path=state_path,
                 )
@@ -253,7 +291,7 @@ class DashboardLogicTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             with patch("server.run_analysis", return_value=analysis), patch(
-                "server.send_wecom_push", side_effect=RuntimeError("send failed"),
+                "server.send_feishu_push", side_effect=RuntimeError("send failed"),
             ):
                 with self.assertRaises(RuntimeError):
                     server.scheduled_push(
@@ -279,7 +317,7 @@ class DashboardLogicTests(unittest.TestCase):
             server.save_trading_state(initial, state_path)
             before = state_path.read_text(encoding="utf-8")
             with patch("server.run_analysis", return_value=analysis), patch(
-                "server.send_wecom_push", side_effect=RuntimeError("send failed"),
+                "server.send_feishu_push", side_effect=RuntimeError("send failed"),
             ):
                 with self.assertRaises(RuntimeError):
                     server.scheduled_push(
@@ -335,7 +373,7 @@ class DashboardLogicTests(unittest.TestCase):
             initial = server.empty_trading_state()
             initial["holdings"] = [holding]
             server.save_trading_state(initial, state_path)
-            with patch("server.run_analysis", return_value=analysis), patch("server.send_wecom_push"):
+            with patch("server.run_analysis", return_value=analysis), patch("server.send_feishu_push"):
                 server.scheduled_push(
                     "morning-decision", self.WEBHOOK, now=now, state_path=state_path,
                 )
@@ -365,7 +403,7 @@ class DashboardLogicTests(unittest.TestCase):
         analysis = self.analysis()
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            with patch("server.run_analysis", return_value=analysis), patch("server.send_wecom_push") as sender:
+            with patch("server.run_analysis", return_value=analysis), patch("server.send_feishu_push") as sender:
                 first = server.scheduled_push(
                     "close-summary", self.WEBHOOK, now=now, state_path=state_path,
                 )
@@ -382,10 +420,10 @@ class DashboardLogicTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             with patch.dict("os.environ", {
-                "WECOM_WEBHOOK": self.WEBHOOK,
+                "FEISHU_WEBHOOK": self.WEBHOOK,
                 "RESOURCE_STATS_FEISHU_WEBHOOK": "must-not-be-read",
             }), patch("server.run_analysis", return_value=analysis), patch(
-                "server.send_wecom_push",
+                "server.send_feishu_push",
             ) as sender, patch("urllib.request.urlopen") as post:
                 result = server.lightclaw_prepare(
                     "tail-decision", now=now, state_path=state_path, test_message=True,
@@ -394,7 +432,7 @@ class DashboardLogicTests(unittest.TestCase):
         self.assertEqual(result["status"], "prepared")
         self.assertIn("LightClaw 测试", result["message"])
         self.assertIn("当前飞书会话确认送达后", result["message"])
-        self.assertNotIn("企业微信机器人", result["message"])
+        self.assertNotIn("飞书自定义机器人无法接收回复", result["message"])
         self.assertEqual(state["holdings"], [])
         self.assertEqual(state["processed_events"], [])
         self.assertEqual(state["pending_report"]["event_id"], result["event_id"])
@@ -494,7 +532,7 @@ class DashboardLogicTests(unittest.TestCase):
                 prepared = server.lightclaw_prepare("tail-decision", now=now, state_path=state_path)
             before = state_path.read_bytes()
             with patch("server.run_analysis", return_value=analysis) as analyzer, patch(
-                "server.send_wecom_push",
+                "server.send_feishu_push",
             ) as sender, patch("server.persist_decision") as persister, patch(
                 "server.apply_scheduled_report",
             ) as applier, patch("server.save_trading_state") as saver:
@@ -533,7 +571,7 @@ class DashboardLogicTests(unittest.TestCase):
                 return analysis
 
             with patch("server.run_analysis", side_effect=create_concurrent_pending) as analyzer, patch(
-                "server.send_wecom_push",
+                "server.send_feishu_push",
             ) as sender, patch("server.persist_decision") as persister, patch(
                 "server.apply_scheduled_report",
             ) as applier:
@@ -555,7 +593,7 @@ class DashboardLogicTests(unittest.TestCase):
             with patch("server.run_analysis", return_value=analysis):
                 prepared = server.lightclaw_prepare("tail-decision", now=now, state_path=state_path)
             server.lightclaw_commit(prepared["commit_token"], now=now, state_path=state_path)
-            with patch("server.run_analysis", return_value=analysis), patch("server.send_wecom_push") as sender:
+            with patch("server.run_analysis", return_value=analysis), patch("server.send_feishu_push") as sender:
                 result = server.scheduled_push(
                     "tail-decision", self.WEBHOOK, now=now, state_path=state_path,
                 )
@@ -594,7 +632,7 @@ class DashboardLogicTests(unittest.TestCase):
     def test_lightclaw_cli_conflict_is_json_nonzero_and_does_not_read_webhook(self):
         conflict = {"status": "pending_conflict", "reason": "pending"}
         output = io.StringIO()
-        environ = {"WECOM_WEBHOOK": "must-not-be-read", "RESOURCE_STATS_FEISHU_WEBHOOK": "must-not-be-read"}
+        environ = {"FEISHU_WEBHOOK": "must-not-be-read", "RESOURCE_STATS_FEISHU_WEBHOOK": "must-not-be-read"}
         with patch.object(sys, "argv", ["server.py", "--lightclaw-prepare", "tail-decision"]), patch(
             "server.lightclaw_prepare", return_value=conflict,
         ), patch.dict("os.environ", environ, clear=True), patch("sys.stdout", output):
@@ -939,9 +977,9 @@ class DashboardLogicTests(unittest.TestCase):
         analysis = self.scan_analysis(candidates=[candidate], universe=[{"code": "000001", "last_time": "1000"}])
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            with patch.dict("os.environ", {"WECOM_WEBHOOK": "must-not-read", "RESOURCE_STATS_FEISHU_WEBHOOK": "must-not-read"}, clear=True), \
+            with patch.dict("os.environ", {"FEISHU_WEBHOOK": "must-not-read", "RESOURCE_STATS_FEISHU_WEBHOOK": "must-not-read"}, clear=True), \
                  patch("server.run_analysis", return_value=analysis) as analyzer, \
-                 patch("server.send_wecom_push") as sender, patch("urllib.request.urlopen") as network:
+                 patch("server.send_feishu_push") as sender, patch("urllib.request.urlopen") as network:
                 first = server.lightclaw_scan_prepare(now, state_path)
                 reused = server.lightclaw_scan_prepare(now, state_path)
                 conflict = server.lightclaw_scan_prepare(now + timedelta(minutes=5), state_path)
@@ -990,7 +1028,7 @@ class DashboardLogicTests(unittest.TestCase):
                 state["pending_report"] = invalid
                 server.save_trading_state(state, state_path)
                 before = state_path.read_bytes()
-                with patch("server.run_analysis") as analyzer, patch("server.send_wecom_push") as sender:
+                with patch("server.run_analysis") as analyzer, patch("server.send_feishu_push") as sender:
                     for entry in (
                         lambda: server.lightclaw_scan_prepare(now, state_path),
                         lambda: server.lightclaw_prepare("morning-summary", now, state_path),
@@ -1010,9 +1048,13 @@ class DashboardLogicTests(unittest.TestCase):
             state = server.empty_trading_state()
             state["pending_report"] = {}
             server.save_trading_state(state, state_path)
+            clock = datetime(2026, 8, 25, 10, 0, tzinfo=server.SHANGHAI)
             with patch.object(sys, "argv", ["server.py", "--lightclaw-scan-prepare"]), patch(
                 "server.TRADING_STATE_PATH", state_path,
-            ), patch("server.run_analysis") as analyzer, patch("sys.stdout", output):
+            ), patch("server.datetime") as server_datetime, patch(
+                "server.run_analysis",
+            ) as analyzer, patch("sys.stdout", output):
+                server_datetime.now.return_value = clock
                 self.assertEqual(server.main(), 2)
             analyzer.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())["status"], "corrupt_data")
@@ -1029,9 +1071,9 @@ class DashboardLogicTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.object(sys, "argv", ["server.py", "--scheduled-push", "morning-summary"]), patch(
                     "server.TRADING_STATE_PATH", state_path,
-                ), patch.dict("os.environ", {"WECOM_WEBHOOK": self.WEBHOOK}, clear=True), patch(
+                ), patch.dict("os.environ", {"FEISHU_WEBHOOK": self.WEBHOOK}, clear=True), patch(
                     "server.run_analysis",
-                ) as analyzer, patch("server.send_wecom_push") as sender, patch(
+                ) as analyzer, patch("server.send_feishu_push") as sender, patch(
                     "server.save_trading_state",
                 ) as state_writer, patch("urllib.request.urlopen") as network, patch("sys.stdout", output):
                     self.assertEqual(server.main(), 2)
@@ -1193,7 +1235,7 @@ class DashboardLogicTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(sys, "argv", ["server.py", "--lightclaw-scan-prepare"]), \
              patch("server.lightclaw_scan_prepare", return_value={"status": "conflict"}), \
-             patch.dict("os.environ", {"WECOM_WEBHOOK": "sentinel"}, clear=True), patch("sys.stdout", output):
+             patch.dict("os.environ", {"FEISHU_WEBHOOK": "sentinel"}, clear=True), patch("sys.stdout", output):
             self.assertEqual(server.main(), 3)
         self.assertEqual(json.loads(output.getvalue()), {"status": "conflict"})
         self.assertEqual(output.getvalue().count("\n"), 1)
