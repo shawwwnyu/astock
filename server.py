@@ -2366,6 +2366,11 @@ def main() -> int:
         choices=tuple(SCHEDULED_STAGES),
         help="运行指定阶段的定时分析与推送",
     )
+    parser.add_argument(
+        "--print-report",
+        choices=tuple(SCHEDULED_STAGES),
+        help="只生成指定阶段的报告文本输出到 stdout，不推送、不写交易状态",
+    )
     lightclaw_action = parser.add_mutually_exclusive_group()
     lightclaw_action.add_argument(
         "--lightclaw-prepare",
@@ -2429,6 +2434,31 @@ def main() -> int:
             return 2
         except Exception as error:
             print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
+            return 1
+    if args.print_report:
+        try:
+            now = datetime.now(SHANGHAI)
+            stage = args.print_report
+            if stage not in SCHEDULED_STAGES:
+                print(f"未知阶段：{stage}")
+                return 2
+            manual_holdings = load_manual_holdings()
+            persistence_data: dict[str, Any] = {}
+            analysis = run_analysis(now=now, stage=stage, persist=False, persistence_data=persistence_data)
+            today = now.strftime("%Y%m%d")
+            if analysis.get("trade_date") != today:
+                print(f"行情不是当日数据（{analysis.get('trade_date')}），可能休市")
+                return 0
+            state = load_trading_state()
+            report = build_scheduled_report(stage, analysis, state, manual_holdings)
+            text = format_scheduled_message(report)
+            # 去掉 markdown 加粗和引用符号，输出纯文本方便直接粘贴/转发
+            text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
+            text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+            print(text)
+            return 0
+        except Exception as error:
+            print(f"生成报告失败：{error}")
             return 1
     if args.push_once or args.scheduled_push:
         app_id = os.environ.get("FEISHU_APP_ID", "").strip()
