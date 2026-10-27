@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""A-share short-term dashboard and scheduled WeCom trading assistant."""
+"""A-share short-term dashboard and scheduled Feishu push assistant."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import fcntl
+import hmac
 import json
 import hashlib
 import math
@@ -77,7 +79,7 @@ _cache: dict[str, Any] = {"expires": 0.0, "data": None}
 _push_lock = threading.Lock()
 _state_lock = threading.Lock()
 _scheduler_stop = threading.Event()
-PUSH_CONFIG_PATH = DATA_DIR / "wecom-push.json"
+PUSH_CONFIG_PATH = DATA_DIR / "feishu-push.json"
 TRADING_STATE_PATH = DATA_DIR / "trading-state.json"
 
 SCHEDULED_STAGES = {
@@ -142,39 +144,50 @@ def fetch_json(url: str, timeout: int = 15, retries: int = 2) -> dict[str, Any]:
     raise RuntimeError(str(last_error) if last_error else "network request failed")
 
 
-def validate_wecom_webhook(webhook: str) -> str:
+def validate_feishu_webhook(webhook: str) -> str:
     webhook = webhook.strip()
     parsed = urllib.parse.urlparse(webhook)
-    key = urllib.parse.parse_qs(parsed.query).get("key", [""])[0]
+    token = parsed.path.rsplit("/", 1)[-1]
     if (
         parsed.scheme != "https"
-        or parsed.hostname != "qyapi.weixin.qq.com"
-        or parsed.path != "/cgi-bin/webhook/send"
-        or len(key) < 20
+        or parsed.hostname != "open.feishu.cn"
+        or parsed.path.count("/") != 5
+        or not parsed.path.startswith("/open-apis/bot/v2/hook/")
+        or len(token) < 20
+        or parsed.query
+        or parsed.fragment
     ):
-        raise ValueError("必须使用企业微信群机器人生成的官方 Webhook 地址")
+        raise ValueError("必须使用飞书群自定义机器人生成的官方 Webhook 地址")
     return webhook
 
 
 def load_push_config(include_secret: bool = False) -> dict[str, Any]:
     with _push_lock:
         if not PUSH_CONFIG_PATH.exists():
-            config = {"enabled": False, "webhook": "", "last_sent": "", "last_result": "尚未配置"}
+            config = {
+                "enabled": False, "webhook": "", "signing_secret": "",
+                "last_sent": "", "last_result": "尚未配置",
+            }
         else:
             try:
                 config = json.loads(PUSH_CONFIG_PATH.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
-                config = {"enabled": False, "webhook": "", "last_sent": "", "last_result": "配置文件损坏"}
+                config = {
+                    "enabled": False, "webhook": "", "signing_secret": "",
+                    "last_sent": "", "last_result": "配置文件损坏",
+                }
     status = {
         "configured": bool(config.get("webhook")),
+        "signed": bool(config.get("signing_secret")),
         "enabled": bool(config.get("enabled")),
         "last_sent": str(config.get("last_sent", "")),
         "last_result": str(config.get("last_result", "")),
         "schedule": "交易日 10:00 / 10:30 / 14:30 / 15:30",
-        "channel": "企业微信群机器人",
+        "channel": "飞书群自定义机器人",
     }
     if include_secret:
         status["webhook"] = str(config.get("webhook", ""))
+        status["signing_secret"] = str(config.get("signing_secret", ""))
     return status
 
 
@@ -182,7 +195,9 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
     current = load_push_config(include_secret=True)
     webhook = str(update.get("webhook", "")).strip()
     if webhook:
-        current["webhook"] = validate_wecom_webhook(webhook)
+        current["webhook"] = validate_feishu_webhook(webhook)
+    if "signing_secret" in update and str(update["signing_secret"]).strip():
+        current["signing_secret"] = str(update["signing_secret"]).strip()
     if "enabled" in update:
         current["enabled"] = bool(update["enabled"])
     if current.get("enabled") and not current.get("webhook"):
@@ -195,6 +210,7 @@ def save_push_config(update: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(current.get("enabled")),
         "last_sent": current.get("last_sent", ""),
         "last_result": current.get("last_result", ""),
+        "signing_secret": current.get("signing_secret", ""),
     }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     temporary = PUSH_CONFIG_PATH.with_suffix(".tmp")
@@ -323,7 +339,7 @@ def percent_text(value: Any) -> str:
     return f"{number:+.2f}%"
 
 
-def format_wecom_message(analysis: dict[str, Any], test: bool = False) -> str:
+def format_push_message(analysis: dict[str, Any], test: bool = False) -> str:
     prefix = "测试 · " if test else ""
     lines = [
         f"**{prefix}{analysis.get('trade_date', '')} 隔夜雷达**",
@@ -378,6 +394,21 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
             lines.append("10:00 仅报告早盘情况，10:30 再给持仓和交易决定。")
         else:
             lines.append("收盘总结使用截至15:00的行情，本条不产生交易操作。")
+            for holding in report.get("manual_holding_reviews", []):
+                current_price = holding.get("current_price")
+                lines.extend([
+                    "",
+                    f"**持仓监控 · {holding.get('name', '')} {holding.get('code', '')}**",
+                    f">买入日：{holding.get('buy_date', '')} · 成本：{holding.get('buy_price', 0):.3f} · 数量：{holding.get('shares', 0)} 股",
+                ])
+                if current_price is None:
+                    lines.append(">收盘行情缺失，浮动盈亏无法计算。")
+                else:
+                    lines.extend([
+                        f">收盘价：{current_price:.3f} · 浮动盈亏：{holding['floating_pnl']:+.2f} 元（{percent_text(holding['return_pct'])}）",
+                    ])
+            if report.get("manual_holding_reviews"):
+                lines.append(">此处仅汇报价格与浮动盈亏，不生成该持仓的买卖指令。")
     else:
         reviews = report.get("holding_reviews", [])
         buys = report.get("buys", [])
@@ -422,7 +453,7 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
             lines.append(f">{note}")
         lines.extend([
             "",
-            "企业微信机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
+            "飞书自定义机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
         ])
     lines.extend(["", "仅供研究参考，不构成个性化投资建议。"])
     return "\n".join(lines)[:3800]
@@ -433,27 +464,40 @@ def format_lightclaw_message(report: dict[str, Any], test: bool = False) -> str:
     if test:
         message = message.replace("**", "**LightClaw 测试 · ", 1)
     return message.replace(
-        "企业微信机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
+        "飞书自定义机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
         "本消息经当前飞书会话确认送达后，系统才会记录上述明确买入/卖出指令；持有、观察和空仓不产生交易。",
     )
 
 
-def send_wecom_push(
+def send_feishu_push(
     payload: dict[str, Any], test: bool = False, webhook: str | None = None,
+    signing_secret: str | None = None,
 ) -> dict[str, Any]:
-    webhook = webhook or load_push_config(include_secret=True).get("webhook", "")
+    config = load_push_config(include_secret=True)
+    webhook = webhook or config.get("webhook", "")
     if not webhook:
-        raise RuntimeError("尚未配置企业微信 Webhook")
-    webhook = validate_wecom_webhook(webhook)
-    message = (
+        raise RuntimeError("尚未配置飞书机器人 Webhook")
+    webhook = validate_feishu_webhook(webhook)
+    markdown_message = (
         format_scheduled_message(payload, test=test)
         if payload.get("report_type") == "scheduled"
-        else format_wecom_message(payload, test=test)
+        else format_push_message(payload, test=test)
     )
-    body = json.dumps({
-        "msgtype": "markdown",
-        "markdown": {"content": message},
-    }, ensure_ascii=False).encode("utf-8")
+    message = re.sub(r"^>\s?", "", markdown_message, flags=re.MULTILINE)
+    message = re.sub(r"\*\*(.*?)\*\*", r"\1", message)
+    message = re.sub(r"`([^`]*)`", r"\1", message)
+    body_data: dict[str, Any] = {"msg_type": "text", "content": {"text": message}}
+    signing_secret = signing_secret if signing_secret is not None else config.get("signing_secret", "")
+    if signing_secret:
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{timestamp}\n{signing_secret}"
+        signature = base64.b64encode(
+            hmac.new(string_to_sign.encode("utf-8"), b"", digestmod=hashlib.sha256).digest(),
+        ).decode("utf-8")
+        body_data.update({"timestamp": timestamp, "sign": signature})
+    body = json.dumps(body_data, ensure_ascii=False).encode("utf-8")
+    if len(body) > 20_000:
+        raise ValueError("飞书机器人消息超过 20 KB 限制")
     request = urllib.request.Request(
         webhook,
         data=body,
@@ -462,8 +506,8 @@ def send_wecom_push(
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         result = json.loads(response.read().decode("utf-8"))
-    if result.get("errcode") != 0:
-        raise RuntimeError(f"企业微信返回错误：{result.get('errmsg', 'unknown')}")
+    if result.get("code") != 0:
+        raise RuntimeError(f"飞书机器人返回错误：{result.get('msg', 'unknown')}")
     return result
 
 
@@ -1169,6 +1213,73 @@ def stock_lookup(analysis: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def load_manual_holdings(raw: str | None = None) -> list[dict[str, Any]]:
+    raw = os.environ.get("ASTOCK_MANUAL_HOLDINGS", "") if raw is None else raw
+    if not raw.strip():
+        return []
+    try:
+        holdings = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"ASTOCK_MANUAL_HOLDINGS 必须是 JSON 数组：{error}") from error
+    if not isinstance(holdings, list):
+        raise ValueError("ASTOCK_MANUAL_HOLDINGS 必须是 JSON 数组")
+    normalized = []
+    seen_codes = set()
+    for holding in holdings:
+        if not isinstance(holding, dict) or set(holding) != {"code", "shares", "buy_price", "buy_date"}:
+            raise ValueError("每笔人工持仓必须且只能包含 code、shares、buy_price、buy_date")
+        code = str(holding["code"])
+        shares = holding["shares"]
+        buy_price = as_number(holding["buy_price"])
+        buy_date = str(holding["buy_date"])
+        try:
+            parsed_date = datetime.strptime(buy_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("人工持仓 buy_date 必须使用 YYYY-MM-DD 日期") from error
+        if (
+            len(code) != 6 or not code.isdigit()
+            or code in seen_codes
+            or not isinstance(shares, int) or isinstance(shares, bool) or shares <= 0
+            or buy_price is None or buy_price <= 0
+            or parsed_date.strftime("%Y-%m-%d") != buy_date
+        ):
+            raise ValueError("人工持仓的股票代码、数量、成本或买入日期无效")
+        seen_codes.add(code)
+        normalized.append({
+            "code": code,
+            "shares": shares,
+            "buy_price": buy_price,
+            "buy_date": buy_date,
+        })
+    return normalized
+
+
+def review_manual_holdings(
+    holdings: list[dict[str, Any]], analysis: dict[str, Any],
+) -> list[dict[str, Any]]:
+    stocks = stock_lookup(analysis)
+    reviews = []
+    for holding in holdings:
+        stock = stocks.get(holding["code"], {})
+        current_price = as_number(stock.get("price"))
+        floating_pnl = (
+            round((current_price - holding["buy_price"]) * holding["shares"], 2)
+            if current_price is not None else None
+        )
+        return_pct = (
+            round((current_price / holding["buy_price"] - 1) * 100, 2)
+            if current_price is not None else None
+        )
+        reviews.append({
+            **holding,
+            "name": str(stock.get("name") or holding["code"]),
+            "current_price": current_price,
+            "floating_pnl": floating_pnl,
+            "return_pct": return_pct,
+        })
+    return reviews
+
+
 def holding_session_number(holding: dict[str, Any], analysis: dict[str, Any]) -> int:
     buy_date = str(holding.get("buy_date", "")).replace("-", "")
     trade_date = str(analysis.get("trade_date", "")).replace("-", "")
@@ -1248,6 +1359,7 @@ def build_scheduled_report(
     stage: str,
     analysis: dict[str, Any],
     state: dict[str, Any],
+    manual_holdings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
@@ -1281,6 +1393,10 @@ def build_scheduled_report(
         "event_id": f"{analysis.get('trade_date', '')}:{stage}",
         "analysis": analysis,
         "holding_reviews": reviews,
+        "manual_holding_reviews": (
+            review_manual_holdings(manual_holdings or [], analysis)
+            if stage == "close-summary" else []
+        ),
         "buys": buys,
         "notes": notes,
     }
@@ -1326,7 +1442,7 @@ def decorate_analysis_with_state(
     if sells and report["buys"]:
         payload["decision"] = "buy"
         payload["headline"] = f"卖出 {sells} 只，并买入 {len(report['buys'])} 只"
-        payload["summary"] = "企业微信推送成功后，按参考价默认记录上述明确指令。"
+        payload["summary"] = "飞书机器人推送成功后，按参考价默认记录上述明确指令。"
     elif sells:
         payload["decision"] = "cash"
         payload["headline"] = f"{sells} 个卖点，按计划退出"
@@ -1978,7 +2094,7 @@ def scheduled_push_conflict(state: dict[str, Any], event_id: str) -> dict[str, A
     if pending is not None:
         return {
             "sent": False,
-            "reason": "存在未完成的 LightClaw pending，禁止企业微信外发和状态应用",
+            "reason": "存在未完成的 LightClaw pending，禁止机器人外发和状态应用",
             "status": "pending_conflict",
             "event_id": event_id,
             "pending_event_id": pending.get("event_id", ""),
@@ -1991,9 +2107,11 @@ def scheduled_push(
     webhook: str,
     now: datetime | None = None,
     state_path: Path | None = None,
+    signing_secret: str | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
-    webhook = validate_wecom_webhook(webhook)
+    webhook = validate_feishu_webhook(webhook)
+    manual_holdings = load_manual_holdings()
     if stage not in SCHEDULED_STAGES:
         raise ValueError(f"未知定时阶段：{stage}")
     today = now.strftime("%Y%m%d")
@@ -2024,11 +2142,11 @@ def scheduled_push(
         conflict = scheduled_push_conflict(state, event_id)
         if conflict:
             return conflict
-        report = build_scheduled_report(stage, analysis, state)
+        report = build_scheduled_report(stage, analysis, state, manual_holdings)
         minute_rows = persistence_data.get("minute_rows")
         if minute_rows is not None:
             persist_decision(analysis, minute_rows)
-        send_wecom_push(report, webhook=webhook)
+        send_feishu_push(report, webhook=webhook, signing_secret=signing_secret)
         updated = apply_scheduled_report(state, report, now)
         save_trading_state(updated, locked_path)
     return {
@@ -2062,7 +2180,10 @@ def push_scheduler_loop() -> None:
         if not config.get("enabled") or not config.get("webhook") or config.get("last_sent") == event_id:
             continue
         try:
-            result = scheduled_push(stage, config["webhook"], now=now)
+            result = scheduled_push(
+                stage, config["webhook"], now=now,
+                signing_secret=config.get("signing_secret", ""),
+            )
             status = "推送成功" if result.get("sent") else f"跳过：{result.get('reason', '无需推送')}"
             save_push_config({"last_sent": event_id, "last_result": f"{now:%Y-%m-%d %H:%M} {status}"})
         except Exception as error:
@@ -2109,7 +2230,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_json(save_push_config(payload))
             else:
                 analysis = get_analysis(force=False)
-                send_wecom_push(analysis, test=True)
+                send_feishu_push(analysis, test=True)
                 now = datetime.now(SHANGHAI)
                 self.send_json(save_push_config({"last_result": f"{now:%Y-%m-%d %H:%M} 测试成功"}))
         except (ValueError, json.JSONDecodeError) as error:
@@ -2205,13 +2326,15 @@ def main() -> int:
             print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
             return 1
     if args.push_once or args.scheduled_push:
-        webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
+        webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
         if not webhook:
-            print(json.dumps({"sent": False, "error": "缺少 WECOM_WEBHOOK"}, ensure_ascii=False))
+            print(json.dumps({"sent": False, "error": "缺少 FEISHU_WEBHOOK"}, ensure_ascii=False))
             return 2
         try:
             stage = args.scheduled_push or "tail-decision"
-            result = scheduled_push(stage, webhook)
+            result = scheduled_push(
+                stage, webhook, signing_secret=os.environ.get("FEISHU_SIGNING_SECRET", ""),
+            )
             print(json.dumps(result, ensure_ascii=False))
             return 0
         except CorruptLocalData as error:
@@ -2221,7 +2344,7 @@ def main() -> int:
             print(json.dumps({"sent": False, "error": str(error)}, ensure_ascii=False))
             return 1
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    scheduler = threading.Thread(target=push_scheduler_loop, name="wecom-push-scheduler", daemon=True)
+    scheduler = threading.Thread(target=push_scheduler_loop, name="feishu-push-scheduler", daemon=True)
     scheduler.start()
     print(f"A-share dashboard: http://{args.host}:{args.port}", flush=True)
     try:

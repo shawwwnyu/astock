@@ -272,14 +272,18 @@
 
   <dialog id="push-dialog" aria-labelledby="push-dialog-title">
     <div class="dialog-head">
-      <h2 class="dialog-title" id="push-dialog-title">企业微信推送</h2>
+      <h2 class="dialog-title" id="push-dialog-title">飞书机器人推送</h2>
       <button class="icon-button" id="push-close" type="button" title="关闭" aria-label="关闭">×</button>
     </div>
     <form id="push-form">
       <div class="dialog-body">
         <label class="field">
-          <span class="field-label">消息推送 Webhook</span>
-          <input class="field-input" id="push-webhook" type="password" autocomplete="off" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+          <span class="field-label">飞书自定义机器人 Webhook</span>
+          <input class="field-input" id="push-webhook" type="password" autocomplete="off" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...">
+        </label>
+        <label class="field">
+          <span class="field-label">签名密钥（可选）</span>
+          <input class="field-input" id="push-signing-secret" type="password" autocomplete="new-password" placeholder="仅在机器人启用了签名校验时填写">
         </label>
         <label class="toggle-row"><input id="push-enabled" type="checkbox">交易日四时点自动推送</label>
         <div class="push-status" id="push-status">正在读取推送状态...</div>
@@ -352,10 +356,13 @@
         if (!response.ok || result.error) throw new Error(result.error || `HTTP ${response.status}`);
         state.push = result;
         document.getElementById('push-enabled').checked = Boolean(result.enabled);
+        document.getElementById('push-signing-secret').placeholder = result.signed
+          ? '签名密钥已保存；留空保持不变'
+          : '仅在机器人启用了签名校验时填写';
         document.getElementById('push-test').disabled = !result.configured;
         pushStatusNode.textContent = result.configured
           ? `${result.channel}已配置 · ${result.enabled ? '自动推送已开启' : '自动推送已关闭'} · ${result.last_result || '尚未发送'}`
-          : '尚未配置企业微信 Webhook。完整地址不会在保存后回显。';
+          : '尚未配置飞书机器人 Webhook。完整地址和签名密钥不会在保存后回显。';
       } catch (error) {
         pushStatusNode.textContent = `状态读取失败：${error.message || error}`;
       }
@@ -364,11 +371,13 @@
     async function savePushSettings(event) {
       event.preventDefault();
       const webhook = document.getElementById('push-webhook').value.trim();
+      const signing_secret = document.getElementById('push-signing-secret').value.trim();
       const enabled = document.getElementById('push-enabled').checked;
       pushStatusNode.textContent = '正在保存配置...';
       try {
-        const result = await postJSON('/api/push/config', {webhook, enabled});
+        const result = await postJSON('/api/push/config', {webhook, signing_secret, enabled});
         document.getElementById('push-webhook').value = '';
+        document.getElementById('push-signing-secret').value = '';
         state.push = result;
         await loadPushStatus();
       } catch (error) {
@@ -473,7 +482,7 @@
       if (!holdings.length && !trades.length) return '';
       const holdingTable = holdings.length ? `<div class="table-wrap"><table><thead><tr><th>假定持仓</th><th>成本 / 现价</th><th>浮动收益率</th><th>持有进度</th><th>当前安排</th></tr></thead><tbody>
         ${holdings.map((item) => `<tr><td><strong>${esc(item.name)}</strong><br><span class="stock-code">${esc(item.code)} · ${num(item.shares, 0)}股</span></td><td>${num(item.buy_price, 3)} / ${num(item.current_price, 3)}</td><td class="${tone(item.return_pct)}"><strong>${pct(item.return_pct)}</strong></td><td>第 ${num(item.holding_session, 0)} / 3 个可卖交易日</td><td>${item.review_decision === 'sell' && data.phase === 'morning-decision' ? '<strong class="red">10:30 卖出</strong>' : '等待10:30复核'}</td></tr>`).join('')}
-      </tbody></table></div>` : `<div class="empty"><strong>当前没有假定持仓</strong><p>只有企业微信成功发出明确买入指令后，系统才会记录持仓。</p></div>`;
+      </tbody></table></div>` : `<div class="empty"><strong>当前没有假定持仓</strong><p>只有飞书机器人成功发出明确买入指令后，系统才会记录持仓。</p></div>`;
       const historyTable = trades.length ? `<details class="diagnostics"><summary>最近卖出记录 ${trades.length} 笔</summary><div class="table-wrap"><table><thead><tr><th>证券</th><th>买入 / 卖出</th><th>收益率</th><th>卖出日期</th></tr></thead><tbody>
         ${trades.map((item) => `<tr><td><strong>${esc(item.name)}</strong><br><span class="stock-code">${esc(item.code)}</span></td><td>${num(item.buy_price, 3)} / ${num(item.sell_price, 3)}</td><td class="${tone(item.return_pct)}"><strong>${pct(item.return_pct)}</strong></td><td>${esc(item.sell_date)}</td></tr>`).join('')}
       </tbody></table></div></details>` : '';

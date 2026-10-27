@@ -30,7 +30,9 @@ jobs:
     timeout-minutes: 15
     env:
       TZ: Asia/Shanghai
-      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+      FEISHU_SIGNING_SECRET: ${{ secrets.FEISHU_SIGNING_SECRET }}
+      ASTOCK_MANUAL_HOLDINGS: ${{ secrets.ASTOCK_MANUAL_HOLDINGS }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
