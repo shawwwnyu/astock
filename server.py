@@ -88,6 +88,12 @@ FEISHU_OPEN_API_BASE = "https://open.feishu.cn/open-apis"
 _token_cache: dict[str, Any] = {"token": "", "expires": 0.0}
 
 SCHEDULED_STAGES = {
+    "open-summary": {
+        "cutoff": 9 * 60 + 35,
+        "push_time": 9 * 60 + 35,
+        "label": "9:35 开盘速览",
+        "entry": False,
+    },
     "morning-summary": {
         "cutoff": 10 * 60,
         "push_time": 10 * 60,
