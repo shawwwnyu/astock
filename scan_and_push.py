@@ -51,6 +51,36 @@ def signal_button(action: dict) -> dict:
     }
 
 
+def kline_chart_element(code: str) -> dict | None:
+    """获取近20日K线，生成 VChart 蜡烛图配置。"""
+    try:
+        symbol = server.symbol_for(code)
+        history = server.fetch_history(symbol)
+        bars = history.get("raw_rows", [])[-20:]
+        if len(bars) < 10:
+            return None
+        data = []
+        for bar in bars:
+            date_str = str(bar[0])[5:]  # MM-DD
+            data.append({
+                "date": date_str,
+                "open": float(bar[1]),
+                "close": float(bar[2]),
+                "low": float(bar[3]),
+                "high": float(bar[4]),
+            })
+        spec = {
+            "type": "candlestick",
+            "data": [{"id": "kline", "values": data}],
+            "xField": "date",
+            "yField": "open,close,high,low",
+            "height": 180,
+        }
+        return {"tag": "chart", "spec": spec, "title": {"text": f"{code} 近20日K线"}}
+    except Exception:
+        return None
+
+
 def build_signal_card(result: dict) -> dict:
     actions = result.get("actions", [])
     if not actions:
@@ -65,6 +95,10 @@ def build_signal_card(result: dict) -> dict:
     ]
     from llm import analyze_buy_signal, analyze_sell_signal
     for action in actions:
+        # 加K线图
+        chart = kline_chart_element(action["code"])
+        if chart:
+            elements.append(chart)
         explain = analyze_buy_signal if action["side"] == "buy" else analyze_sell_signal
         try:
             text = explain({key: action[key] for key in (
