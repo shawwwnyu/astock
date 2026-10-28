@@ -25,6 +25,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 import lark_oapi as lark
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast, CallBackCard
 
 import server
 
@@ -333,12 +334,139 @@ def do_message(data: P2ImMessageReceiveV1) -> None:
         log(traceback.format_exc())
 
 
+def do_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+    """处理卡片按钮回调。"""
+    try:
+        action = data.event.action
+        value = action.value or {}
+        form_value = action.form_value or {}
+        action_type = value.get("action", "")
+        code = value.get("code", "")
+        name = get_stock_name(code)
+
+        # 表单提交（输入价格后确认）
+        if action_type == "submit_trade":
+            price_str = form_value.get("price", "0")
+            try:
+                price = float(price_str)
+            except ValueError:
+                price = 0
+            trade_action = value.get("trade_action", "buy")
+            if trade_action == "buy":
+                result = handle_buy_with_price(code, price)
+            else:
+                result = handle_sell_with_price(code, price)
+            return P2CardActionTriggerResponse({
+                "toast": {"type": "success", "content": result},
+                "card": {"type": "raw", "data": json.loads(make_reply_card(
+                    f"{name}({code})", "green" if trade_action == "buy" else "red",
+                    [result], "已记录"
+                ))},
+            })
+
+        # 按钮点击：弹出价格输入表单
+        if action_type in ("confirm_buy", "confirm_sell"):
+            trade_action = "buy" if action_type == "confirm_buy" else "sell"
+            action_label = "买入" if trade_action == "buy" else "卖出"
+            form_card = {
+                "schema": "2.0",
+                "config": {"update_multi": True, "width_mode": "default"},
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"确认{action_label} {name}({code})"},
+                    "template": "green" if trade_action == "buy" else "red",
+                },
+                "body": {
+                    "direction": "vertical", "padding": "12px 12px 20px 12px",
+                    "vertical_spacing": "12px",
+                    "elements": [
+                        {
+                            "tag": "form",
+                            "name": "trade_form",
+                            "elements": [
+                                {
+                                    "tag": "input",
+                                    "name": "price",
+                                    "placeholder": {"tag": "plain_text", "content": "输入成交价格，如 28.15"},
+                                    "label": {"tag": "plain_text", "content": "成交价格"},
+                                    "default": "",
+                                },
+                                {
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": f"确认{action_label}"},
+                                    "type": "primary" if trade_action == "buy" else "danger",
+                                    "form_action_type": "submit",
+                                    "behaviors": [{"type": "callback", "value": {"action": "submit_trade", "code": code, "trade_action": trade_action}}],
+                                },
+                            ],
+                        }
+                    ],
+                },
+            }
+            return P2CardActionTriggerResponse({
+                "card": {"type": "raw", "data": form_card},
+            })
+
+        return P2CardActionTriggerResponse({
+            "toast": {"type": "warning", "content": "未知操作"},
+        })
+    except Exception as e:
+        log(f"卡片回调异常: {e}")
+        import traceback
+        log(traceback.format_exc())
+        return P2CardActionTriggerResponse({
+            "toast": {"type": "error", "content": f"处理失败: {e}"},
+        })
+
+
+def handle_buy_with_price(code: str, price: float) -> str:
+    """带价格的买入标记。"""
+    name = get_stock_name(code)
+    state = server.load_trading_state()
+    now = datetime.now(SHANGHAI)
+    for h in state.get("holdings", []):
+        if h.get("code") == code and h.get("status") == "open":
+            return f"{name}({code}) 已在持仓中"
+    holding = {
+        "id": f"{now.strftime('%Y%m%d-%H%M')}-{code}",
+        "code": code, "name": name,
+        "buy_date": now.strftime("%Y%m%d"),
+        "buy_time": now.strftime("%H%M"),
+        "buy_price": price, "shares": 0, "capital_used": 0,
+        "invalidation": 0, "target_price": 0,
+        "source": "signal", "status": "open",
+    }
+    state.setdefault("holdings", []).append(holding)
+    server.save_trading_state(state)
+    return f"{name}({code}) 已买入，价格 {price}"
+
+
+def handle_sell_with_price(code: str, price: float) -> str:
+    """带价格的卖出标记。"""
+    name = get_stock_name(code)
+    state = server.load_trading_state()
+    for h in state.get("holdings", []):
+        if h.get("code") == code and h.get("status") == "open":
+            h["status"] = "closed"
+            h["sell_price"] = price
+            h["sell_time"] = datetime.now(SHANGHAI).strftime("%H%M")
+            state.setdefault("history", []).append(h)
+            state["holdings"].remove(h)
+            server.save_trading_state(state)
+            return f"{name}({code}) 已卖出，价格 {price}"
+    return f"{name}({code}) 无持仓可卖"
+
+
 def main():
     if not APP_ID or not APP_SECRET:
         log("错误：请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET 环境变量")
         sys.exit(1)
     log("=== Bot 服务启动 ===")
-    event_handler = EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(do_message).build()
+    event_handler = (
+        EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(do_message)
+        .register_p2_card_action_trigger(do_card_action)
+        .build()
+    )
     cli = lark.ws.Client(APP_ID, APP_SECRET, event_handler=event_handler, log_level=lark.LogLevel.INFO)
     cli.start()
 

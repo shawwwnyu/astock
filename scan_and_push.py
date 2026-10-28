@@ -62,6 +62,35 @@ def scan_once() -> bool:
         tag = "盘中信号"
 
     now_str = datetime.now(SHANGHAI).strftime("%H:%M")
+
+    # 从消息中提取股票代码（6位数字）
+    import re as _re
+    code_match = _re.search(r"(\d{6})", message)
+    stock_code = code_match.group(1) if code_match else ""
+
+    elements = [
+        {"tag": "markdown", "content": message},
+    ]
+    # 信号卡片加操作按钮
+    if stock_code:
+        if header_color == "green":
+            # 买入信号：确认买入按钮
+            elements.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✓ 确认买入"},
+                "type": "primary",
+                "behaviors": [{"type": "callback", "value": {"action": "confirm_buy", "code": stock_code}}],
+            })
+        elif header_color == "red":
+            # 卖出信号：确认卖出按钮
+            elements.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✓ 确认卖出"},
+                "type": "danger",
+                "behaviors": [{"type": "callback", "value": {"action": "confirm_sell", "code": stock_code}}],
+            })
+    elements.append({"tag": "markdown", "content": "<font color='grey'>仅供研究参考，不构成个性化投资建议</font>", "text_size": "notation"})
+
     card = {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "default"},
@@ -77,10 +106,7 @@ def scan_once() -> bool:
         "body": {
             "direction": "vertical", "padding": "12px 12px 20px 12px",
             "vertical_spacing": "8px",
-            "elements": [
-                {"tag": "markdown", "content": message},
-                {"tag": "markdown", "content": "<font color='grey'>仅供研究参考，不构成个性化投资建议</font>", "text_size": "notation"},
-            ],
+            "elements": elements,
         },
     }
     card_json = json.dumps(card, ensure_ascii=False)
