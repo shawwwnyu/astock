@@ -110,8 +110,6 @@ def report_sections(analysis: dict) -> dict[str, str]:
     jobs = [("AI盘面解读", lambda: daily_market_summary({
         "market": market, "indices": analysis.get("indices", []), "breadth": analysis.get("breadth", {}),
     }))]
-    if candidates and market.get("state") in {"green", "yellow"}:
-        jobs.append(("AI关注候选（非买入指令）", lambda: pick_top_picks(candidates, market)))
     sections = {}
     for label, generate in jobs:
         try:
