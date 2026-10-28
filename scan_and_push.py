@@ -118,6 +118,60 @@ def scan_once() -> bool:
     return True
 
 
+def check_position_risks() -> None:
+    """检查持仓股票是否跌破止损位，是则推送风险卡片。"""
+    state = server.load_trading_state()
+    holdings = state.get("holdings", [])
+    if not holdings:
+        return
+    risk_key = "position_risk_notified"
+    notified = set(state.get(risk_key, []))
+    now_str = datetime.now(SHANGHAI).strftime("%Y%m%d")
+    new_risks = []
+    for h in holdings:
+        if h.get("status") != "open":
+            continue
+        code = h["code"]
+        stop_loss = h.get("invalidation", 0)
+        if not stop_loss:
+            continue
+        try:
+            symbol = server.symbol_for(code)
+            minute = server.fetch_minute(symbol)
+            price = minute["price"]
+        except Exception:
+            continue
+        if price <= stop_loss:
+            risk_id = f"{now_str}-{code}-stop"
+            if risk_id not in notified:
+                new_risks.append({**h, "current_price": price})
+                notified.add(risk_id)
+    if new_risks:
+        elements = [{"tag": "markdown", "content": "**⚠️ 持仓风险预警**"}]
+        for h in new_risks:
+            pnl_pct = (h["current_price"] - h["buy_price"]) / h["buy_price"] * 100
+            elements.append({
+                "tag": "markdown",
+                "content": f"**{h['name']}({h['code']})**\n"
+                           f"现价：{h['current_price']:.2f} | 买入：{h['buy_price']:.2f} | "
+                           f"盈亏：{pnl_pct:+.2f}%\n"
+                           f"已跌破止损位 {h['invalidation']:.2f}，建议卖出止损",
+            })
+        card = {
+            "schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": "持仓止损预警"}, "template": "red"},
+            "body": {"elements": elements},
+        }
+        delivery = command_result(run([
+            sys.executable, "-B", "send_bot.py", TARGET_CHAT_ID,
+            json.dumps(card, ensure_ascii=False),
+        ]))
+        if delivery.get("code") == 0:
+            state[risk_key] = list(notified)
+            server.save_trading_state(state)
+            print(f"[{datetime.now(SHANGHAI):%H:%M}] 已推送持仓止损预警：{[h['code'] for h in new_risks]}")
+
+
 def in_scan_window(now: datetime) -> bool:
     return server.scan_window_status(now)[0]
 
@@ -142,6 +196,10 @@ def main() -> int:
                 scan_once()
             except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
                 print(f"扫描异常：{error}", file=sys.stderr)
+            try:
+                check_position_risks()
+            except Exception as error:
+                print(f"风险检查异常：{error}", file=sys.stderr)
         time.sleep(SCAN_INTERVAL)
     return 0
 
