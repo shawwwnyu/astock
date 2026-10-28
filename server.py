@@ -26,6 +26,7 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 from zoneinfo import ZoneInfo
+from strategy_rules import effective_parameters
 
 from weekly_review import (
     DEFAULT_PARAMETERS, STRATEGY_VERSION, archive_formal_event, archive_path_for,
@@ -321,6 +322,7 @@ def empty_trading_state() -> dict[str, Any]:
         "actual_trade_receipts": {},
         "delivered_signals": {},
         "scan_deliveries": {},
+        "strategy_adjustments": [],
     }
 
 
@@ -358,7 +360,7 @@ def load_trading_state(path: Path | None = None) -> dict[str, Any]:
         raise RuntimeError("交易状态文件格式无效")
     normalized = empty_trading_state()
     normalized.update(state)
-    for key in ("holdings", "history", "processed_events", "committed_deliveries", "actual_holdings", "actual_history"):
+    for key in ("holdings", "history", "processed_events", "committed_deliveries", "actual_holdings", "actual_history", "strategy_adjustments"):
         if not isinstance(normalized.get(key), list):
             raise RuntimeError(f"交易状态字段 {key} 格式无效")
     for key in ("actual_trade_receipts", "delivered_signals", "scan_deliveries"):
@@ -452,7 +454,7 @@ def format_push_message(analysis: dict[str, Any], test: bool = False) -> str:
             "",
         ])
     lines.extend([
-        "持有计划：下一交易日10:30复核；无卖点可继续持有，第3个可卖交易日必须退出。",
+        f"持有计划：下一交易日10:30复核；无卖点可继续持有，第{analysis.get('parameters', {}).get('max_holding_sessions', MAX_HOLDING_SESSIONS)}个可卖交易日必须退出。",
         "仅供研究参考，不构成个性化投资建议。",
     ])
     return "\n".join(lines)[:3800]
@@ -460,6 +462,7 @@ def format_push_message(analysis: dict[str, Any], test: bool = False) -> str:
 
 def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
     analysis = report["analysis"]
+    max_sessions = analysis.get("parameters", {}).get("max_holding_sessions", MAX_HOLDING_SESSIONS)
     prefix = "测试 · " if test else ""
     lines = [
         f"**{prefix}{analysis.get('trade_date', '')} {report.get('label', 'A股短线助手')}**",
@@ -511,7 +514,7 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
                     f">动作：卖出全部 {holding.get('shares', 0)} 股",
                     f">成本：{holding.get('buy_price', '未核验')} · 参考卖价：{current_price if current_price is not None else '未核验'}",
                     f">本次收益率：{percent_text(item.get('return_pct'))}（按参考价估算，未计费用与滑点）",
-                    f">持有：第 {item.get('holding_session', 0)} / {MAX_HOLDING_SESSIONS} 个可卖交易日",
+                    f">持有：第 {item.get('holding_session', 0)} / {max_sessions} 个可卖交易日",
                     f">原因：{'；'.join(item.get('reasons', []))}",
                     "",
                 ])
@@ -521,7 +524,7 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
                     f">动作：继续持有，本次不卖",
                     f">成本：{holding.get('buy_price', '未核验')} · 现价：{current_price if current_price is not None else '未核验'}",
                     f">当前浮动收益率：{percent_text(item.get('return_pct'))}（未计费用与滑点）",
-                    f">持有：第 {item.get('holding_session', 0)} / {MAX_HOLDING_SESSIONS} 个可卖交易日",
+                    f">持有：第 {item.get('holding_session', 0)} / {max_sessions} 个可卖交易日",
                     f">依据：{'；'.join(item.get('reasons', []))}",
                     "",
                 ])
@@ -531,7 +534,7 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
                 f">参考买价：{stock.get('price', '未核验')} · 区间：{stock.get('entry_range', '未核验')}",
                 f">数量：{stock.get('shares', 0)} 股 · 仓位：{stock.get('position_pct', 0)}% · 资金：{stock.get('capital_used', 0)} 元",
                 f">失效参考：{stock.get('invalidation', '未核验')} · 目标参考：{stock.get('resistance', '未核验')}",
-                ">安排：下一交易日10:30复核；无卖点继续持有，第3个可卖交易日强制退出。",
+                f">安排：下一交易日10:30复核；无卖点继续持有，第{max_sessions}个可卖交易日强制退出。",
                 "",
             ])
         if not reviews and not buys:
@@ -906,7 +909,9 @@ def analyze_security(
     history: dict[str, Any],
     benchmark_returns: dict[str, dict[str, float]],
     cutoff_minutes: int,
+    rule_parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    minimum_reward_risk = (rule_parameters or DEFAULT_PARAMETERS)["minimum_reward_risk"]
     bars = synthesize_bars(history, minute)
     indicators = calculate_indicators(bars)
     closes = [float(bar["close"]) for bar in bars]
@@ -968,8 +973,8 @@ def analyze_security(
     limit_warning = 15.0 if code.startswith(("300", "688")) else 7.5
     if (minute["change_pct"] or 0) >= limit_warning:
         failures.append("接近涨停区域，不追高")
-    if reward_risk < 2.0:
-        failures.append("至前20日阻力位的空间不足2R")
+    if reward_risk < minimum_reward_risk:
+        failures.append(f"至前20日阻力位的空间不足{minimum_reward_risk:g}R")
     risk_pct = risk / current * 100 if current else 0
     if risk_pct < 0.6:
         warnings.append("结构失效距离较窄，容易受盘中噪声影响")
@@ -1111,6 +1116,7 @@ def run_analysis(
     if not trade_dates:
         raise RuntimeError("实时分时行情全部获取失败")
     trade_date = max(trade_dates)
+    rule_parameters = effective_parameters(load_trading_state(), trade_date)
     phase, phase_label = determine_phase(now, trade_date)
     if stage:
         phase = stage
@@ -1161,7 +1167,7 @@ def run_analysis(
         if not minute or not history:
             continue
         try:
-            securities.append(analyze_security(code, minute, history, benchmark_returns, cutoff_minutes))
+            securities.append(analyze_security(code, minute, history, benchmark_returns, cutoff_minutes, rule_parameters))
         except Exception as error:
             errors.append(f"{symbol} security analysis: {error}")
     securities.sort(key=lambda item: item["score"], reverse=True)
@@ -1223,7 +1229,7 @@ def run_analysis(
         per_position = 0
     elif entry_phase:
         decision, headline = "cash", "空仓，仓位 0%"
-        summary = "没有股票同时通过市场、技术、分时、2R与公告硬门槛。"
+        summary = f"没有股票同时通过市场、技术、分时、{rule_parameters['minimum_reward_risk']:g}R与公告硬门槛。"
         per_position = 0
     else:
         decision, headline = "cash", "当前不可新开仓"
@@ -1250,7 +1256,7 @@ def run_analysis(
         item["exit_plan"] = [
             {"time": "T+1 10:30", "action": "出现失效、目标位或早盘走弱信号则卖出"},
             {"time": "T+1 / T+2", "action": "没有卖点可继续持有，不因时间焦虑强行交易"},
-            {"time": "T+3 10:30", "action": "达到最长持有期，卖出全部可成交数量"},
+            {"time": f"T+{rule_parameters['max_holding_sessions']} 10:30", "action": "达到最长持有期，卖出全部可成交数量"},
         ]
         item.pop("minute_records", None)
     universe = []
@@ -1286,7 +1292,7 @@ def run_analysis(
         "trading_dates": sorted(trading_dates),
         "capital": CAPITAL,
         "strategy_version": STRATEGY_VERSION,
-        "parameters": {**DEFAULT_PARAMETERS, "capital": CAPITAL},
+        "parameters": {**DEFAULT_PARAMETERS, **rule_parameters, "capital": CAPITAL},
         "universe_version": UNIVERSE_VERSION,
         "stock_pool": list(watchlist),
         "stock_pool_hash": hashlib.sha256(
@@ -1350,6 +1356,8 @@ def get_analysis(
         if (
             not force and _cache["data"] is not None and now_monotonic < _cache["expires"]
             and _cache["data"].get("stock_pool") == watchlist
+            and all(_cache["data"].get("parameters", {}).get(key) == value for key, value in
+                    effective_parameters(load_trading_state(), datetime.now(SHANGHAI).strftime("%Y%m%d")).items())
         ):
             return _cache["data"]
         data = run_analysis()
@@ -1461,6 +1469,7 @@ def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dic
     stocks = stock_lookup(analysis)
     market = analysis.get("market", {})
     reviews = []
+    max_sessions = analysis.get("parameters", {}).get("max_holding_sessions", MAX_HOLDING_SESSIONS)
     for holding in state.get("holdings", []):
         stock = stocks.get(str(holding.get("code")))
         session_number = holding_session_number(holding, analysis)
@@ -1481,8 +1490,8 @@ def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dic
         vwap = as_number(stock.get("vwap"))
         return_pct = ((current / buy_price - 1) * 100) if buy_price else None
         sell_reasons = []
-        if session_number >= MAX_HOLDING_SESSIONS:
-            sell_reasons.append(f"已到第{MAX_HOLDING_SESSIONS}个可卖交易日，达到最长持有期")
+        if session_number >= max_sessions:
+            sell_reasons.append(f"已到第{max_sessions}个可卖交易日，达到最长持有期")
         if invalidation is not None and invalidation > 0 and current <= invalidation:
             sell_reasons.append("价格跌至交易逻辑失效位")
         if target is not None and target > 0 and current >= target:

@@ -29,8 +29,8 @@ class WatchlistTests(unittest.TestCase):
         self.addCleanup(server._cache.update, original_cache)
         state["actual_holdings"] = [{"code": "000001", "status": "open"}]
         with patch("server.load_trading_state", return_value=state), patch("server.run_analysis") as analyze:
-            first = {"stock_pool": server.effective_watchlist()}
-            second = {"stock_pool": list(server.WATCHLIST)}
+            first = {"stock_pool": server.effective_watchlist(), "parameters": dict(server.DEFAULT_PARAMETERS)}
+            second = {"stock_pool": list(server.WATCHLIST), "parameters": dict(server.DEFAULT_PARAMETERS)}
             analyze.side_effect = [first, second]
             self.assertEqual(server.get_analysis(force=True), first)
             self.assertEqual(server.get_analysis(), first)
