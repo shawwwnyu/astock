@@ -21,7 +21,7 @@ def chat(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": temperature,
-        "max_tokens": 500,
+        "max_tokens": 2000,
     }
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
@@ -32,11 +32,11 @@ def chat(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
         return result["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"[LLM] 调用失败: {e}", flush=True)
+        print(f"[LLM] 调用失败: {type(e).__name__}: {e}", flush=True)
         return ""
 
 
@@ -70,3 +70,22 @@ def daily_market_summary(market_data: dict) -> str:
     )
     user = json.dumps(market_data, ensure_ascii=False)
     return chat(sys_prompt, user)
+
+
+def pick_top_picks(candidates: list[dict], market_context: dict) -> str:
+    """让大模型从候选股票中选出 top 推荐。
+
+    candidates: 前10只股票的关键指标（code, name, price, change_pct, trend,
+                 macd, rs1, rs3, score, invalidation, resistance, reward_risk,
+                 failures, warnings）
+    market_context: 大盘状态（红/黄/绿灯）、指数表现
+    """
+    sys_prompt = (
+        "你是A股短线交易专家。以下是自选池中评分最高的10只股票的技术指标数据。"
+        "请综合考虑：均线排列、MACD形态、相对强度(RS)、盈亏比、大盘环境，"
+        "选出最值得关注的3只股票，每只用一行输出：\n"
+        "**股票名称(代码)** — 一句话理由（含关键价位）\n"
+        "不要输出多余内容，最多3行。如果大盘红灯，明确提示风险。"
+    )
+    user = json.dumps({"market": market_context, "stocks": candidates}, ensure_ascii=False)
+    return chat(sys_prompt, user, temperature=0.2)

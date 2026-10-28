@@ -2544,7 +2544,7 @@ def main() -> int:
 
             # LLM 盘面解读
             try:
-                from llm import daily_market_summary
+                from llm import daily_market_summary, pick_top_picks
                 market_data = {
                     "market": market.get("summary", ""),
                     "indices": [{"name": i.get("name"), "price": i.get("price"),
@@ -2557,6 +2557,22 @@ def main() -> int:
                         "tag": "markdown",
                         "content": f"**AI盘面解读：** {llm_text}",
                     })
+
+                # AI 选股推荐：取前10只股票指标喂给大模型
+                universe = analysis.get("universe", [])
+                top10 = [{k: v for k, v in s.items() if v is not None} for s in universe[:10]]
+                if top10:
+                    picks_text = pick_top_picks(top10, {"state": market.get("state"), "label": market_label})
+                    if picks_text:
+                        elements.append({
+                            "tag": "interactive_container",
+                            "elements": [
+                                {"tag": "markdown", "content": f"**AI选股推荐：**\n{picks_text}"},
+                            ],
+                            "background_style": "blue-50",
+                            "corner_radius": "8px",
+                            "padding": "12px",
+                        })
             except Exception:
                 pass
 
