@@ -94,6 +94,12 @@ SCHEDULED_STAGES = {
         "label": "10:00 早盘概况",
         "entry": False,
     },
+    "midday-summary": {
+        "cutoff": 11 * 60 + 30,
+        "push_time": 11 * 60 + 30,
+        "label": "11:30 午盘总结",
+        "entry": False,
+    },
     "morning-decision": {
         "cutoff": 10 * 60 + 30,
         "push_time": 10 * 60 + 30,
