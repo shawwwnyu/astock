@@ -1050,6 +1050,20 @@ def market_state(index_rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"state": state, "label": label, "summary": summary, "average_change_pct": round(average, 2)}
 
 
+def effective_watchlist() -> list[str]:
+    state = load_trading_state()
+    codes = list(WATCHLIST)
+    for holding in state["actual_holdings"]:
+        if holding.get("status", "open") != "open":
+            continue
+        code = holding.get("code")
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+            raise CorruptLocalData("实际持仓股票代码无效")
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
 def run_analysis(
     now: datetime | None = None,
     cutoff_minutes: int | None = None,
@@ -1075,7 +1089,8 @@ def run_analysis(
             cutoff_minutes = min(max(current_minutes, 9 * 60 + 30), 15 * 60)
     if not 9 * 60 + 30 <= cutoff_minutes <= 15 * 60:
         raise ValueError("行情截点必须位于09:30-15:00")
-    symbols = [symbol_for(code) for code in WATCHLIST]
+    watchlist = effective_watchlist()
+    symbols = [symbol_for(code) for code in watchlist]
     all_symbols = symbols + list(BENCHMARKS)
     minute_raw: dict[str, dict[str, Any]] = {}
     history_raw: dict[str, dict[str, Any]] = {}
@@ -1139,7 +1154,7 @@ def run_analysis(
             errors.append(f"{symbol} index analysis: {error}")
     market = market_state(index_rows)
     securities = []
-    for code in WATCHLIST:
+    for code in watchlist:
         symbol = symbol_for(code)
         minute = parsed_minutes.get(symbol)
         history = history_raw.get(symbol)
@@ -1273,9 +1288,9 @@ def run_analysis(
         "strategy_version": STRATEGY_VERSION,
         "parameters": {**DEFAULT_PARAMETERS, "capital": CAPITAL},
         "universe_version": UNIVERSE_VERSION,
-        "stock_pool": list(WATCHLIST),
+        "stock_pool": list(watchlist),
         "stock_pool_hash": hashlib.sha256(
-            json.dumps(WATCHLIST, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            json.dumps(watchlist, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
         "position_pct": round(sum(item["position_pct"] for item in display_candidates), 1),
         "candidates": display_candidates,
@@ -1330,8 +1345,12 @@ def get_analysis(
     if now is not None or cutoff_minutes is not None or stage is not None:
         return run_analysis(now=now, cutoff_minutes=cutoff_minutes, stage=stage)
     now_monotonic = time.monotonic()
+    watchlist = effective_watchlist()
     with _cache_lock:
-        if not force and _cache["data"] is not None and now_monotonic < _cache["expires"]:
+        if (
+            not force and _cache["data"] is not None and now_monotonic < _cache["expires"]
+            and _cache["data"].get("stock_pool") == watchlist
+        ):
             return _cache["data"]
         data = run_analysis()
         _cache["data"] = data
