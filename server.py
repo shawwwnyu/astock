@@ -624,17 +624,44 @@ def fetch_minute(symbol: str) -> dict[str, Any]:
     }
 
 
+def fetch_history_sina(symbol: str) -> dict[str, Any]:
+    """新浪财经日线接口 fallback，返回与腾讯相同的二维数组格式。"""
+    url = (
+        f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={urllib.parse.quote(symbol)}"
+        f"&scale=240&ma=no&datalen=70"
+    )
+    payload = fetch_json(url)
+    if not isinstance(payload, list) or len(payload) < 35:
+        raise RuntimeError(f"insufficient sina history for {symbol}")
+    raw_rows = []
+    for item in payload:
+        raw_rows.append([
+            item.get("day", ""),
+            item.get("open", ""),
+            item.get("close", ""),
+            item.get("high", ""),
+            item.get("low", ""),
+            item.get("volume", ""),
+        ])
+    return {"symbol": symbol, "raw_rows": raw_rows}
+
+
 def fetch_history(symbol: str) -> dict[str, Any]:
     param = urllib.parse.quote(f"{symbol},day,,,70,qfq")
     url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={param}"
-    payload = fetch_json(url)
-    node = payload.get("data", {}).get(symbol)
-    if payload.get("code") != 0 or not isinstance(node, dict):
-        raise RuntimeError(f"invalid history response for {symbol}")
-    raw_rows = node.get("qfqday") or node.get("day") or []
-    if not isinstance(raw_rows, list) or len(raw_rows) < 35:
-        raise RuntimeError(f"insufficient history for {symbol}")
-    return {"symbol": symbol, "raw_rows": raw_rows}
+    try:
+        payload = fetch_json(url)
+        node = payload.get("data", {}).get(symbol)
+        if payload.get("code") != 0 or not isinstance(node, dict):
+            raise RuntimeError(f"invalid history response for {symbol}")
+        raw_rows = node.get("qfqday") or node.get("day") or []
+        if not isinstance(raw_rows, list) or len(raw_rows) < 35:
+            raise RuntimeError(f"insufficient history for {symbol}")
+        return {"symbol": symbol, "raw_rows": raw_rows}
+    except Exception:
+        # 腾讯接口被 WAF 拦截或失败时，fallback 到新浪
+        return fetch_history_sina(symbol)
 
 
 def fetch_announcements(code: str, trade_date: str) -> dict[str, Any]:
@@ -2451,11 +2478,93 @@ def main() -> int:
                 return 0
             state = load_trading_state()
             report = build_scheduled_report(stage, analysis, state, manual_holdings)
-            text = format_scheduled_message(report)
-            # 去掉 markdown 加粗和引用符号，输出纯文本方便直接粘贴/转发
-            text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
-            text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-            print(text)
+
+            # 构造飞书卡片 2.0 JSON
+            market = analysis.get("market", {})
+            market_label = market.get("label", "未核验")
+            market_summary = market.get("summary", "")
+            is_red = market.get("state") == "red"
+            header_template = "red" if is_red else ("green" if market.get("state") == "green" else "yellow")
+
+            indices = analysis.get("indices", [])
+            breadth = analysis.get("breadth", {})
+
+            def fmt_pct(v):
+                if v is None:
+                    return "—"
+                sign = "+" if v > 0 else ""
+                return f"{sign}{v:.2f}%"
+
+            def pct_color(v):
+                if v is None or v == 0:
+                    return "grey"
+                return "green" if v > 0 else "red"
+
+            # 指数指标列（取前4个）
+            index_columns = []
+            for idx in indices[:4]:
+                chg = idx.get("change_pct")
+                color = pct_color(chg)
+                index_columns.append({
+                    "tag": "column", "width": "weighted", "weight": 1,
+                    "background_style": f"{color}-50", "padding": "12px", "vertical_spacing": "2px",
+                    "elements": [
+                        {"tag": "markdown", "content": f"**{idx.get('name','')}**", "text_align": "center"},
+                        {"tag": "markdown", "content": f"## <font color='{color}'>{idx.get('price','—')}</font>", "text_align": "center"},
+                        {"tag": "markdown", "content": f"<font color='grey'>{fmt_pct(chg)}</font>", "text_align": "center", "text_size": "notation"},
+                    ],
+                })
+
+            up = breadth.get("up", 0)
+            down = breadth.get("down", 0)
+            flat = breadth.get("flat", 0)
+            avg_chg = breadth.get("average_change_pct")
+
+            breadth_columns = [
+                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
+                 "elements": [{"tag": "markdown", "content": f"<font color='green'>上涨 {up}</font>", "text_align": "center"}]},
+                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
+                 "elements": [{"tag": "markdown", "content": f"<font color='red'>下跌 {down}</font>", "text_align": "center"}]},
+                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
+                 "elements": [{"tag": "markdown", "content": f"<font color='grey'>平盘 {flat}</font>", "text_align": "center"}]},
+                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
+                 "elements": [{"tag": "markdown", "content": f"**平均 {fmt_pct(avg_chg)}**", "text_align": "center"}]},
+            ]
+
+            elements = []
+            if index_columns:
+                elements.append({
+                    "tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
+                    "columns": index_columns,
+                })
+            elements.append({
+                "tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
+                "columns": breadth_columns,
+            })
+            elements.append({
+                "tag": "markdown",
+                "content": f"<font color='grey'>{market_summary} · 仅供研究参考，不构成个性化投资建议</font>",
+                "text_size": "notation",
+            })
+
+            card = {
+                "schema": "2.0",
+                "config": {"update_multi": True, "width_mode": "default"},
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"A股{report.get('label', '收盘总结')}"},
+                    "subtitle": {"tag": "plain_text", "content": f"{analysis.get('trade_date','')} · 数据截至 {analysis.get('data_as_of','')}"},
+                    "template": header_template,
+                    "icon": {"tag": "standard_icon", "token": "calendar_colorful"},
+                    "text_tag_list": [
+                        {"tag": "text_tag", "text": {"tag": "plain_text", "content": market_label}, "color": header_template}
+                    ],
+                },
+                "body": {
+                    "direction": "vertical", "padding": "12px 12px 20px 12px",
+                    "vertical_spacing": "12px", "elements": elements,
+                },
+            }
+            print(json.dumps(card, ensure_ascii=False))
             return 0
         except Exception as error:
             print(f"生成报告失败：{error}")
