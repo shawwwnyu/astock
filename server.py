@@ -316,6 +316,11 @@ def empty_trading_state() -> dict[str, Any]:
         "pending_report": None,
         "signal_trade_date": "",
         "signal_states": {},
+        "actual_holdings": [],
+        "actual_history": [],
+        "actual_trade_receipts": {},
+        "delivered_signals": {},
+        "scan_deliveries": {},
     }
 
 
@@ -353,8 +358,11 @@ def load_trading_state(path: Path | None = None) -> dict[str, Any]:
         raise RuntimeError("交易状态文件格式无效")
     normalized = empty_trading_state()
     normalized.update(state)
-    for key in ("holdings", "history", "processed_events", "committed_deliveries"):
+    for key in ("holdings", "history", "processed_events", "committed_deliveries", "actual_holdings", "actual_history"):
         if not isinstance(normalized.get(key), list):
+            raise RuntimeError(f"交易状态字段 {key} 格式无效")
+    for key in ("actual_trade_receipts", "delivered_signals", "scan_deliveries"):
+        if not isinstance(normalized[key], dict):
             raise RuntimeError(f"交易状态字段 {key} 格式无效")
     committed_tokens = normalized.get("committed_delivery_tokens")
     if not isinstance(committed_tokens, dict):
@@ -537,8 +545,13 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
             "",
             "飞书自定义机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
         ])
-    lines.extend(["", "仅供研究参考，不构成个性化投资建议。"])
-    return "\n".join(lines)[:3800]
+    if "ai_sections" not in report:
+        # 冻结 pending 必须能逐字重建，保留原格式及截断方式。
+        return "\n".join(lines + ["", "仅供研究参考，不构成个性化投资建议。"])[:3800]
+    for label, text in report["ai_sections"].items():
+        lines.extend(["", f"**{label}**", text])
+    disclaimer = "\n\n仅供研究参考，不构成个性化投资建议。"
+    return "\n".join(lines)[:3800 - len(disclaimer)] + disclaimer
 
 
 def format_lightclaw_message(report: dict[str, Any], test: bool = False) -> str:
@@ -1401,6 +1414,21 @@ def review_manual_holdings(
     return reviews
 
 
+def enrich_summary_report(
+    report: dict[str, Any], state: dict[str, Any], ai_sections: dict[str, str],
+) -> dict[str, Any]:
+    if report["stage"] != "close-summary":
+        return report
+    result = copy.deepcopy(report)
+    actual = state["actual_holdings"]
+    actual_codes = {item["code"] for item in actual}
+    result["manual_holding_reviews"] = [
+        item for item in result["manual_holding_reviews"] if item["code"] not in actual_codes
+    ] + review_manual_holdings(actual, result["analysis"])
+    result["ai_sections"] = ai_sections
+    return result
+
+
 def holding_session_number(holding: dict[str, Any], analysis: dict[str, Any]) -> int:
     buy_date = str(holding.get("buy_date", "")).replace("-", "")
     trade_date = str(analysis.get("trade_date", "")).replace("-", "")
@@ -1436,9 +1464,9 @@ def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dic
         sell_reasons = []
         if session_number >= MAX_HOLDING_SESSIONS:
             sell_reasons.append(f"已到第{MAX_HOLDING_SESSIONS}个可卖交易日，达到最长持有期")
-        if invalidation is not None and current <= invalidation:
+        if invalidation is not None and invalidation > 0 and current <= invalidation:
             sell_reasons.append("价格跌至交易逻辑失效位")
-        if target is not None and current >= target:
+        if target is not None and target > 0 and current >= target:
             sell_reasons.append("价格达到计划目标位")
         if stock.get("trend") == "空头排列":
             sell_reasons.append("日线均线转为空头排列")
@@ -1998,12 +2026,38 @@ def _validate_pending(pending: Any, state: dict[str, Any]) -> dict[str, Any]:
     return validated
 
 
+def scan_delivery_payload(pending: dict[str, Any], status: str, state: dict[str, Any]) -> dict[str, Any]:
+    report = pending["report"]
+    return {
+        "status": status, "event_id": pending["event_id"], "commit_token": pending["commit_token"],
+        "message": pending["message"], "actions": copy.deepcopy(report["actions"]),
+        "decision_at": report["decision_at"], "trade_date": report["analysis"]["trade_date"],
+        "trade_actions": report["trade_actions"],
+        "delivery_message_id": state["scan_deliveries"].get(pending["event_id"], ""),
+    }
+
+
+def record_scan_delivery(event_id: str, message_id: str, state_path: Path | None = None) -> None:
+    if not isinstance(message_id, str) or not message_id.strip():
+        raise ValueError("飞书未返回 message_id，不得提交")
+    with trading_state_transaction(state_path) as locked_path:
+        state = load_trading_state(locked_path)
+        pending = _validate_pending(state.get("pending_report"), state)
+        if pending["kind"] != "intraday-scan" or pending["event_id"] != event_id:
+            raise ValueError("送达记录与 pending 不匹配")
+        previous = state["scan_deliveries"].get(event_id)
+        if previous and previous != message_id:
+            raise ValueError("同一批次返回了不同的飞书消息标识")
+        state["scan_deliveries"][event_id] = message_id
+        save_trading_state(state, locked_path)
+
+
 def lightclaw_scan_prepare(
-    now: datetime | None = None, state_path: Path | None = None,
+    now: datetime | None = None, state_path: Path | None = None, resume_pending: bool = False,
 ) -> dict[str, Any]:
     now = now or datetime.now(SHANGHAI)
     allowed, reason = scan_window_status(now)
-    if not allowed:
+    if not allowed and not resume_pending:
         return {"status": "no_signal", "reason": reason, "decision_at": now.isoformat(timespec="seconds")}
     today = now.strftime("%Y%m%d")
     batch_prefix = f"{today}:scan:{now:%H%M}:"
@@ -2012,15 +2066,16 @@ def lightclaw_scan_prepare(
         pending = state.get("pending_report")
         if pending is not None:
             pending = _validate_pending(pending, state)
-            if str(pending.get("event_id", "")).startswith(batch_prefix):
-                return {
-                    "status": "already_pending", "event_id": pending.get("event_id", ""),
-                    "commit_token": pending.get("commit_token", ""), "message": pending.get("message", ""),
-                }
+            if pending["kind"] == "intraday-scan" and (
+                resume_pending or str(pending["event_id"]).startswith(batch_prefix)
+            ):
+                return scan_delivery_payload(pending, "already_pending", state)
             return {
                 "status": "conflict", "reason": "存在其他未送达 pending，禁止覆盖",
                 "pending_event_id": pending.get("event_id", ""),
             }
+        if not allowed:
+            return {"status": "no_signal", "reason": reason, "decision_at": now.isoformat(timespec="seconds")}
         persistence_data: dict[str, Any] = {}
         cutoff = now.hour * 60 + now.minute
         analysis = run_analysis(
@@ -2055,10 +2110,7 @@ def lightclaw_scan_prepare(
             persistence_data.get("execution_rows", {}), "intraday-scan",
         )
         save_trading_state(state, locked_path)
-    return {
-        "status": "prepared", "event_id": report["event_id"], "commit_token": token,
-        "message": message, "trade_actions": len(report["actions"]),
-    }
+    return scan_delivery_payload(state["pending_report"], "prepared", state)
 
 
 def lightclaw_prepare(
@@ -2175,6 +2227,17 @@ def lightclaw_commit(
         else:
             updated = apply_scheduled_report(state, report, now)
         updated["pending_report"] = None
+        if pending["kind"] == "intraday-scan":
+            for action in report["actions"]:
+                updated["delivered_signals"][action["notification_fingerprint"]] = {
+                    **{key: copy.deepcopy(action[key]) for key in (
+                        "side", "code", "name", "price", "invalidation", "resistance", "reasons",
+                        "holding_id", "notification_fingerprint",
+                    ) if key in action},
+                    "trade_date": report["analysis"]["trade_date"],
+                    "event_id": report["event_id"],
+                    "strategy_holding_id": f"{report['analysis']['trade_date']}-{report['scan_time']}-{action['code']}",
+                }
         updated.setdefault("committed_delivery_tokens", {})[commit_token] = report["event_id"]
         archive_path = None
         formal_event = None
@@ -2262,12 +2325,15 @@ def scheduled_push(
             "market_data_time": analysis.get("market_data_time", ""),
             "required_time": minutes_to_hhmm(required_minutes),
         }
+    from llm import report_sections
+    ai_sections = report_sections(analysis) if stage == "close-summary" else {}
     with trading_state_transaction(state_path) as locked_path:
         state = load_trading_state(locked_path)
         conflict = scheduled_push_conflict(state, event_id)
         if conflict:
             return conflict
         report = build_scheduled_report(stage, analysis, state, manual_holdings)
+        report = enrich_summary_report(report, state, ai_sections)
         minute_rows = persistence_data.get("minute_rows")
         if minute_rows is not None:
             persist_decision(analysis, minute_rows)
@@ -2415,6 +2481,10 @@ def main() -> int:
         help="仅在上层确认飞书送达后提交对应 token",
     )
     parser.add_argument(
+        "--resume-pending", action="store_true",
+        help="优先恢复未提交的盘中批次，包含前一轮或闭市后的待发送批次",
+    )
+    parser.add_argument(
         "--lightclaw-test-message",
         action="store_true",
         help="为并行观察期消息添加 LightClaw 测试标记",
@@ -2451,7 +2521,7 @@ def main() -> int:
             elif args.lightclaw_scan_prepare:
                 if args.lightclaw_test_message:
                     raise ValueError("盘中正式扫描不支持测试消息模式")
-                result = lightclaw_scan_prepare()
+                result = lightclaw_scan_prepare(resume_pending=args.resume_pending)
             else:
                 result = lightclaw_commit(args.lightclaw_commit)
             print(json.dumps(result, ensure_ascii=False))
@@ -2474,10 +2544,18 @@ def main() -> int:
             analysis = run_analysis(now=now, stage=stage, persist=False, persistence_data=persistence_data)
             today = now.strftime("%Y%m%d")
             if analysis.get("trade_date") != today:
-                print(f"行情不是当日数据（{analysis.get('trade_date')}），可能休市")
+                print(json.dumps({"status": "no_report", "reason": "行情不是当日数据，可能休市",
+                                  "trade_date": analysis.get("trade_date")}, ensure_ascii=False))
+                return 0
+            if hhmm_to_minutes(str(analysis.get("market_data_time", ""))) < SCHEDULED_STAGES[stage]["cutoff"]:
+                print(json.dumps({"status": "no_report", "reason": "行情尚未达到阶段截点"}, ensure_ascii=False))
                 return 0
             state = load_trading_state()
             report = build_scheduled_report(stage, analysis, state, manual_holdings)
+            from llm import report_sections
+            ai_sections = report_sections(analysis)
+            report = enrich_summary_report(report, state, ai_sections)
+            report["ai_sections"] = ai_sections
 
             # 构造飞书卡片 2.0 JSON
             market = analysis.get("market", {})
@@ -2542,39 +2620,7 @@ def main() -> int:
                 "columns": breadth_columns,
             })
 
-            # LLM 盘面解读
-            try:
-                from llm import daily_market_summary, pick_top_picks
-                market_data = {
-                    "market": market.get("summary", ""),
-                    "indices": [{"name": i.get("name"), "price": i.get("price"),
-                                 "change_pct": i.get("change_pct")} for i in indices],
-                    "breadth": {"up": up, "down": down, "flat": flat, "avg_change_pct": avg_chg},
-                }
-                llm_text = daily_market_summary(market_data)
-                if llm_text:
-                    elements.append({
-                        "tag": "markdown",
-                        "content": f"**AI盘面解读：** {llm_text}",
-                    })
-
-                # AI 选股推荐：取前10只股票指标喂给大模型
-                universe = analysis.get("universe", [])
-                top10 = [{k: v for k, v in s.items() if v is not None} for s in universe[:10]]
-                if top10:
-                    picks_text = pick_top_picks(top10, {"state": market.get("state"), "label": market_label})
-                    if picks_text:
-                        elements.append({
-                            "tag": "interactive_container",
-                            "elements": [
-                                {"tag": "markdown", "content": f"**AI选股推荐：**\n{picks_text}"},
-                            ],
-                            "background_style": "blue-50",
-                            "corner_radius": "8px",
-                            "padding": "12px",
-                        })
-            except Exception:
-                pass
+            elements.append({"tag": "markdown", "content": format_scheduled_message(report)})
 
             elements.append({
                 "tag": "markdown",
@@ -2602,7 +2648,7 @@ def main() -> int:
             print(json.dumps(card, ensure_ascii=False))
             return 0
         except Exception as error:
-            print(f"生成报告失败：{error}")
+            print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
             return 1
     if args.push_once or args.scheduled_push:
         app_id = os.environ.get("FEISHU_APP_ID", "").strip()

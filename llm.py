@@ -3,16 +3,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.request
 
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 BASE_URL = "https://api.deepseek.com"
 MODEL = "deepseek-flash"
 
 
 def chat(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
     """调用 DeepSeek chat API，返回回复文本。"""
-    if not API_KEY:
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
         return ""
     payload = {
         "model": MODEL,
@@ -28,16 +29,18 @@ def chat(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
         data=json.dumps(payload).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": f"Bearer {api_key}",
         },
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
-        return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[LLM] 调用失败: {type(e).__name__}: {e}", flush=True)
-        return ""
+        content = result["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("模型未返回有效文本")
+        return content.strip()
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        raise RuntimeError(f"LLM 调用失败：{type(error).__name__}") from error
 
 
 def analyze_buy_signal(stock_data: dict) -> str:
@@ -45,7 +48,7 @@ def analyze_buy_signal(stock_data: dict) -> str:
     sys_prompt = (
         "你是A股短线交易分析师。根据给出的技术指标数据，用100字以内生成一段买入理由，"
         "包括：当前趋势状态、为什么现在买、关键价位（止损/目标）、主要风险。"
-        "语气专业简洁，不要说'建议''可能'等模糊词，直接给判断。"
+        "仅解释提供的数据，明确不确定性，不编造事实，不将信号当成实际成交。"
     )
     user = json.dumps(stock_data, ensure_ascii=False)
     return chat(sys_prompt, user)
@@ -55,7 +58,7 @@ def analyze_sell_signal(stock_data: dict) -> str:
     """生成卖出理由。"""
     sys_prompt = (
         "你是A股短线交易分析师。根据给出的技术指标数据，用80字以内生成卖出理由，"
-        "说明为什么应该卖出/止损。直接简洁。"
+        "解释给定信号与风险，保留不确定性，不将信号当成实际成交。"
     )
     user = json.dumps(stock_data, ensure_ascii=False)
     return chat(sys_prompt, user)
@@ -65,8 +68,7 @@ def daily_market_summary(market_data: dict) -> str:
     """收盘盘面解读。"""
     sys_prompt = (
         "你是A股市场分析师。根据给出的指数和自选股数据，用150字以内写一段盘面解读，"
-        "包括：今天市场整体情况、主要驱动因素、自选池表现、对明天的简短展望。"
-        "语气专业，不要套话。"
+        "包括今天市场整体情况、自选池表现和风险；不编造新闻、驱动因素或确定的明日走势。"
     )
     user = json.dumps(market_data, ensure_ascii=False)
     return chat(sys_prompt, user)
@@ -89,3 +91,35 @@ def pick_top_picks(candidates: list[dict], market_context: dict) -> str:
     )
     user = json.dumps({"market": market_context, "stocks": candidates}, ensure_ascii=False)
     return chat(sys_prompt, user, temperature=0.2)
+
+
+def report_sections(analysis: dict) -> dict[str, str]:
+    """可选 AI 解读不参与规则决策；失败保持报告可用并明确提示。"""
+    if not os.environ.get("DEEPSEEK_API_KEY", "").strip():
+        return {}
+    market = analysis.get("market", {})
+    fields = (
+        "code", "name", "price", "change_pct", "score", "trend", "macd", "rs1", "rs3",
+        "invalidation", "resistance", "reward_risk", "warnings",
+    )
+    candidates = [
+        {key: stock[key] for key in fields if key in stock}
+        for stock in analysis.get("universe", [])
+        if stock.get("eligible") and not stock.get("failures")
+    ][:10]
+    jobs = [("AI盘面解读", lambda: daily_market_summary({
+        "market": market, "indices": analysis.get("indices", []), "breadth": analysis.get("breadth", {}),
+    }))]
+    if candidates and market.get("state") in {"green", "yellow"}:
+        jobs.append(("AI关注候选（非买入指令）", lambda: pick_top_picks(candidates, market)))
+    sections = {}
+    for label, generate in jobs:
+        try:
+            text = generate()
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("模型未返回有效文本")
+            sections[label] = text[:900]
+        except RuntimeError as error:
+            print(f"[LLM] {label}失败：{error}", file=sys.stderr)
+            sections[label] = "暂不可用，本报告保留原始行情和规则结论。"
+    return sections
