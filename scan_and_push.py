@@ -71,6 +71,21 @@ def scan_once() -> bool:
     elements = [
         {"tag": "markdown", "content": message},
     ]
+
+    # LLM 解读
+    try:
+        from llm import analyze_buy_signal, analyze_sell_signal
+        import json as _json
+        if header_color == "green":
+            llm_text = analyze_buy_signal({"signal": "买入", "message": message})
+        elif header_color == "red":
+            llm_text = analyze_sell_signal({"signal": "卖出", "message": message})
+        else:
+            llm_text = ""
+        if llm_text:
+            elements.append({"tag": "markdown", "content": f"**AI解读：** {llm_text}"})
+    except Exception as e:
+        print(f"[{datetime.now(SHANGHAI):%H:%M}] LLM解读失败: {e}", file=sys.stderr)
     # 信号卡片加操作按钮
     if stock_code:
         if header_color == "green":

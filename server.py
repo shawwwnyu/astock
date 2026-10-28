@@ -2541,6 +2541,25 @@ def main() -> int:
                 "tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
                 "columns": breadth_columns,
             })
+
+            # LLM 盘面解读
+            try:
+                from llm import daily_market_summary
+                market_data = {
+                    "market": market.get("summary", ""),
+                    "indices": [{"name": i.get("name"), "price": i.get("price"),
+                                 "change_pct": i.get("change_pct")} for i in indices],
+                    "breadth": {"up": up, "down": down, "flat": flat, "avg_change_pct": avg_chg},
+                }
+                llm_text = daily_market_summary(market_data)
+                if llm_text:
+                    elements.append({
+                        "tag": "markdown",
+                        "content": f"**AI盘面解读：** {llm_text}",
+                    })
+            except Exception:
+                pass
+
             elements.append({
                 "tag": "markdown",
                 "content": f"<font color='grey'>{market_summary} · 仅供研究参考，不构成个性化投资建议</font>",
