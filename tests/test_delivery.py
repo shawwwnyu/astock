@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import scan_and_push
 import send_bot
+import feishu_client
 import server
 import tests.test_server as fixtures
 
@@ -31,9 +32,12 @@ def completed(payload, code=0):
 
 class DeliveryTests(unittest.TestCase):
     def setUp(self):
-        self.environment = patch.dict("os.environ", {"DEEPSEEK_API_KEY": ""})
+        self.environment = patch.dict("os.environ", {"DEEPSEEK_API_KEY": "", "FEISHU_CHAT_ID": "oc_test"})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        chart = patch("scan_and_push.kline_chart_element", return_value=None)
+        chart.start()
+        self.addCleanup(chart.stop)
 
     def test_sell_code_comes_from_action_not_date_or_buy_disclaimer(self):
         action = {"side": "sell", "code": "300757", "name": "测试", "notification_fingerprint": "a" * 64}
@@ -139,15 +143,15 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(scan_and_push.main(), 1)
 
     def test_sender_uuid_and_business_errors(self):
-        with patch("send_bot.get_tenant_token", return_value="token"), patch(
-            "send_bot.http_post", return_value={"code": 0, "data": {"message_id": "om_1"}},
+        with patch("feishu_client.get_tenant_token", return_value="token"), patch(
+            "feishu_client.http_post", return_value={"code": 0, "data": {"message_id": "om_1"}},
         ) as post:
-            send_bot.send_card("oc_test", "{}", "unique")
+            feishu_client.send_card("oc_test", "{}", "unique")
             self.assertEqual(post.call_args.args[1]["uuid"], "unique")
         for result in ({"code": 123}, {"code": 0, "data": {}}):
-            with patch("send_bot.get_tenant_token", return_value="token"), \
-                 patch("send_bot.http_post", return_value=result), self.assertRaises(RuntimeError):
-                send_bot.send_card("oc_test", "{}")
+            with patch("feishu_client.get_tenant_token", return_value="token"), \
+                 patch("feishu_client.http_post", return_value=result), self.assertRaises(RuntimeError):
+                feishu_client.send_card("oc_test", "{}")
 
     def test_sender_cli_outputs_one_json_object(self):
         result = {"code": 0, "data": {"message_id": "om_1"}}
@@ -163,3 +167,50 @@ class DeliveryTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "no_signal")
         analyzer.assert_not_called()
+
+    def test_risk_alert_parses_raw_quote_and_preserves_concurrent_ledger_update(self):
+        with TemporaryDirectory() as directory, patch("server.TRADING_STATE_PATH", Path(directory) / "state.json"):
+            state = server.load_trading_state()
+            state["holdings"] = [{
+                "code": "000001", "name": "测试", "status": "open",
+                "buy_price": 10, "invalidation": 9,
+            }]
+            server.save_trading_state(state)
+
+            def deliver(_):
+                with server.trading_state_transaction() as path:
+                    latest = server.load_trading_state(path)
+                    latest["actual_trade_receipts"]["concurrent"] = {"shares": 100}
+                    server.save_trading_state(latest, path)
+                return completed({"code": 0, "data": {"message_id": "om_risk"}})
+
+            raw = {"symbol": "sz000001", "trade_date": "20260825", "raw_records": ["1000 8 100 80000"]}
+            with patch("scan_and_push.datetime") as clock, patch("server.fetch_minute", return_value=raw), \
+                 patch("scan_and_push.run", side_effect=deliver) as sender, patch("builtins.print"):
+                clock.now.return_value = NOW
+                scan_and_push.check_position_risks()
+                scan_and_push.check_position_risks()
+            self.assertEqual(sender.call_count, 1)
+            latest = server.load_trading_state()
+            self.assertIn("concurrent", latest["actual_trade_receipts"])
+            self.assertEqual(latest["position_risk_notified"], ["20260825-000001-stop"])
+
+    def test_stale_risk_quote_logs_error_without_sending_or_saving(self):
+        state = {"holdings": [{"code": "000001", "status": "open", "invalidation": 9}]}
+        with patch("server.load_trading_state", return_value=state), \
+             patch("server.fetch_minute", return_value={"trade_date": "20000101"}), \
+             patch("scan_and_push.run") as sender, patch("server.save_trading_state") as save, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            scan_and_push.check_position_risks()
+        sender.assert_not_called()
+        save.assert_not_called()
+        self.assertIn("不是当日数据", stderr.getvalue())
+
+
+class KlineTests(unittest.TestCase):
+    def test_chart_preserves_provider_high_low_order(self):
+        rows = [["2026-08-01", "10", "11", "12", "9", "100"]] * 10
+        with patch("server.fetch_history", return_value={"raw_rows": rows}):
+            chart = scan_and_push.kline_chart_element("000001")
+        candle = chart["spec"]["data"][0]["values"][0]
+        self.assertEqual((candle["high"], candle["low"]), (12, 9))

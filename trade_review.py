@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import sys
@@ -11,8 +12,9 @@ from decimal import Decimal
 
 import server
 import strategy_rules
-from send_bot import send_card
-from scan_and_push import TARGET_CHAT_ID
+from feishu_client import send_card, target_chat_id
+from report_cards import message_card
+import signal_review
 
 
 def money(value) -> Decimal:
@@ -52,6 +54,54 @@ def close_prices(codes: set[str], start: date, end: date) -> dict:
             "close": latest["close"] if latest and day(str(latest["date"])) == end else None,
         }
     return prices
+
+
+def signal_performance(state: dict, start: date, end: date) -> dict:
+    histories = {}
+    missing = []
+    signal_closes = {}
+    codes = {item["code"] for item in state.get("signal_observations", {}).values()
+             if day(item["trade_date"]) <= end}
+    benchmark = next(iter(server.BENCHMARKS))
+    today_codes = {item["code"] for item in state.get("signal_observations", {}).values()
+                   if day(item["trade_date"]) == end}
+    for symbol in sorted({server.symbol_for(code) for code in codes} | ({benchmark} if codes else set())):
+        bars = []
+        try:
+            history = server.fetch_history(symbol)
+            if symbol != benchmark and history.get("adjustment") != "qfq":
+                raise RuntimeError("未取得已核验的前复权日线，不计算信号收益")
+            bars = server.parse_history(history, (end + timedelta(days=1)).strftime("%Y%m%d"))
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            print(f"信号复盘日线获取失败 {symbol}: {error}", file=sys.stderr)
+            missing.append(f"{symbol} 信号后续日线缺失")
+        # A minute failure must not discard verified historical bars.
+        if symbol[2:] in today_codes or not bars or day(bars[-1]["date"]) < end:
+            try:
+                minute = server.fetch_minute(symbol)
+                if day(minute["trade_date"]) == end:
+                    quote = server.parse_minute(minute, 900)
+                    if server.hhmm_to_minutes(quote["last_time"]) >= 900:
+                        signal_closes[symbol[2:]] = quote["price"]
+                        if not bars or day(bars[-1]["date"]) < end:
+                            bars.append({"date": end.isoformat(), "close": quote["price"]})
+            except (OSError, ValueError, RuntimeError, KeyError) as error:
+                print(f"信号复盘收盘分时获取失败 {symbol}: {error}", file=sys.stderr)
+                missing.append(f"{symbol} 当日完整收盘分时缺失")
+        histories[symbol] = bars
+    calendar = [bar["date"] for bar in histories.get(benchmark, [])]
+    evaluated = copy.deepcopy(state)
+    updates = {}
+    for identity, item in evaluated.get("signal_observations", {}).items():
+        if day(item["trade_date"]) == end and item["code"] in signal_closes:
+            item["signal_day_close"] = signal_closes[item["code"]]
+            updates[identity] = item["signal_day_close"]
+    result = signal_review.evaluate(evaluated, start, end, {
+        code: histories.get(server.symbol_for(code), []) for code in codes
+    }, calendar=calendar, adjusted=True)
+    result["missing_data"].extend(missing)
+    result["signal_closes"] = updates
+    return result
 
 
 def build_review(state: dict, period: str, end: date, prices: dict) -> dict:
@@ -135,6 +185,16 @@ def review_card(report: dict) -> dict:
     for item in report["holdings"]:
         lines.append(f"{item['name']}({item['code']}) {item['shares']}股 · 浮盈亏 {amount(item['floating_pnl'])}")
     lines.append("**策略复核**")
+    if "signal_review" in report:
+        performance = report["signal_review"]
+        lines.append(f"信号成熟样本 {performance['matured_count']}，尚未满3个交易日 {performance['pending_count']}。")
+        for key, metric in performance["metrics"].items():
+            rate = metric["directional_hit_rate"]
+            lines.append(f"{key}：{metric['count']}个 · 3日方向正确率 "
+                         + (f"{rate:.1%}" if rate is not None else "样本不足，无法计算"))
+        lines.append(performance["definition"])
+        lines.extend(performance.get("missing_data", []))
+    lines.append(report.get("ai_review", {}).get("analysis", ""))
     lines.append(f"本期卖出记录 {len(report['sells'])} 笔，其中亏损 {report['losing_sales']} 笔（可含部分卖出）。")
     update = report["rule_update"]
     lines.extend([
@@ -142,7 +202,7 @@ def review_card(report: dict) -> dict:
         f"入场最低盈亏比：{update['before']['minimum_reward_risk']}R → {update['after']['minimum_reward_risk']}R",
         f"最长可卖交易日：{update['before']['max_holding_sessions']} → {update['after']['max_holding_sessions']}",
         update["reason"], update["warning"],
-        "周复盘同时展示本周操作；自动规则以当日实际卖出盈亏更新，周五不重复叠加调整。",
+        "日/周复盘分别评估信号；每晚规则最多调整一次，周五不重复叠加。",
         "T+1、禁止自动加仓、仓位上限、市场红灯与数据/公告核验硬约束不变。",
     ])
     lines.extend(report["missing_data"])
@@ -151,10 +211,7 @@ def review_card(report: dict) -> dict:
         f"策略假定持仓 {report['assumed_holdings_count']} 只，未混入实际盈亏。",
         "仅供研究参考，不构成个性化投资建议。",
     ])
-    return {
-        "schema": "2.0", "header": {"title": {"tag": "plain_text", "content": f"A股{label}操作复盘"}, "template": "blue"},
-        "body": {"elements": [{"tag": "markdown", "content": line} for line in lines]},
-    }
+    return message_card(f"A股{label}操作复盘", "blue", lines)
 
 
 def main() -> int:
@@ -165,6 +222,7 @@ def main() -> int:
     parser.add_argument("--apply-rules", action="store_true", help="当天20:00后自动更新有界规则，下一交易日起读取")
     args = parser.parse_args()
     try:
+        chat_id = target_chat_id() if args.send else ""
         end = args.as_of or datetime.now(server.SHANGHAI).date()
         if end > datetime.now(server.SHANGHAI).date():
             raise ValueError("不得复盘未来日期")
@@ -175,23 +233,49 @@ def main() -> int:
         codes = {item["code"] for item in state["actual_holdings"] + state["actual_history"]
                  if day(item["buy_date"]) <= end and ("sell_date" not in item or day(item["sell_date"]) >= start)}
         report = build_review(state, args.period, end, close_prices(codes, start, end))
+        report["signal_review"] = signal_performance(state, start, end)
+        planned = strategy_rules.plan_ai_update(state, report)
+        report["ai_review"] = planned
+        report["rule_update"] = {**planned, "status": "preview"}
         if args.apply_rules:
             with server.trading_state_transaction() as path:
                 latest = server.load_trading_state(path)
-                if any(latest[key] != state[key] for key in ("actual_holdings", "actual_history")):
-                    raise RuntimeError("复盘期间实际账本发生变化，未修改规则；请重新执行")
-                report["rule_update"] = strategy_rules.apply_update(latest, end, datetime.now(server.SHANGHAI))
+                expected_observations = copy.deepcopy(state["signal_observations"])
+                for identity, price in report["signal_review"].get("signal_closes", {}).items():
+                    expected_observations[identity]["signal_day_close"] = price
+                observation_changed = (
+                    latest["signal_observations"] != state["signal_observations"]
+                    and latest["signal_observations"] != expected_observations
+                )
+                original_revisions = state["strategy_adjustments"]
+                latest_revisions = latest["strategy_adjustments"]
+                revisions_changed = (
+                    latest_revisions[:len(original_revisions)] != original_revisions
+                    or any(item["review_date"] != end.isoformat() for item in latest_revisions[len(original_revisions):])
+                )
+                if observation_changed or revisions_changed or any(
+                    latest[key] != state[key] for key in ("actual_holdings", "actual_history")
+                ):
+                    raise RuntimeError("复盘期间账本、信号或规则发生变化，未修改规则；请重新执行")
+                report["rule_update"] = strategy_rules.apply_ai_update(latest, planned, datetime.now(server.SHANGHAI))
+                for identity, price in report["signal_review"].get("signal_closes", {}).items():
+                    latest["signal_observations"][identity]["signal_day_close"] = price
+                if planned["ai_status"] == "ok":
+                    latest.setdefault("ai_reviews", {})[planned["evidence_hash"]] = planned
                 server.save_trading_state(latest, path)
         if args.send:
             event_id = f"actual-review:{args.period}:{start}:{end}"
             # 同一进程间锁覆盖检查/发送/标记，UUID覆盖网络结果不确定时的短期重试。
             with server.trading_state_transaction() as path:
                 latest = server.load_trading_state(path)
+                for identity, price in report["signal_review"].get("signal_closes", {}).items():
+                    if identity in latest["signal_observations"]:
+                        latest["signal_observations"][identity]["signal_day_close"] = price
                 deliveries = latest.setdefault("actual_review_deliveries", {})
                 if event_id in deliveries:
                     report["delivery"] = {"status": "already_sent", "message_id": deliveries[event_id]}
                 else:
-                    result = send_card(TARGET_CHAT_ID, json.dumps(review_card(report), ensure_ascii=False),
+                    result = send_card(chat_id, json.dumps(review_card(report), ensure_ascii=False),
                                        hashlib.sha256(event_id.encode()).hexdigest()[:32])
                     deliveries[event_id] = result["data"]["message_id"]
                     server.save_trading_state(latest, path)

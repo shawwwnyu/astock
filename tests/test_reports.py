@@ -44,25 +44,21 @@ class ReportTests(unittest.TestCase):
                 network.return_value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
                 llm.chat("system", "user")
 
-    def test_ai_candidates_filtered_and_input_analysis_unchanged(self):
+    def test_ai_summary_uses_market_data_without_mutating_analysis(self):
         analysis = self.analysis()
         analysis["universe"].append({"code": "000002", "eligible": False, "failures": ["risk"]})
         analysis["universe"][0]["chart"] = ["large data not needed"]
         original = copy.deepcopy(analysis)
         with patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}), \
-             patch("llm.daily_market_summary", return_value="summary"), \
-             patch("llm.pick_top_picks", return_value="picks") as picks:
+             patch("llm.daily_market_summary", return_value="summary") as summary:
             sections = llm.report_sections(analysis)
-        self.assertEqual(len(sections), 2)
-        candidates = picks.call_args.args[0]
-        self.assertEqual([item["code"] for item in candidates], ["000001"])
-        self.assertNotIn("chart", candidates[0])
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(set(summary.call_args.args[0]), {"market", "indices", "breadth"})
         self.assertEqual(analysis, original)
         analysis["market"]["state"] = "red"
         with patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}), \
-             patch("llm.daily_market_summary", return_value="risk"), patch("llm.pick_top_picks") as picks:
-            llm.report_sections(analysis)
-        picks.assert_not_called()
+             patch("llm.daily_market_summary", return_value="risk"):
+            self.assertEqual(llm.report_sections(analysis), {"AI盘面解读": "risk"})
 
     def run_print_report(self, analysis, state):
         with patch("sys.argv", ["server.py", "--print-report", "close-summary"]), \
@@ -85,7 +81,6 @@ class ReportTests(unittest.TestCase):
         }]
         with patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}), \
              patch("llm.daily_market_summary", side_effect=RuntimeError("offline")), \
-             patch("llm.pick_top_picks", side_effect=RuntimeError("offline")), \
              patch("sys.stderr", new_callable=io.StringIO) as stderr:
             code, card = self.run_print_report(analysis, state)
         self.assertEqual(code, 0)

@@ -29,11 +29,12 @@ if TYPE_CHECKING:
 
 import server
 from actual_trades import record_trade, signal_batch, validate_signal
-from scan_and_push import signal_button
+from report_cards import message_card, signal_button
+from feishu_client import send_card, target_chat_id
 
 APP_ID = os.environ.get("FEISHU_APP_ID", "")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-TARGET_CHAT_ID = "oc_4a44bf793473ba5dd87d50904065a92f"
+TARGET_CHAT_ID = os.environ.get("FEISHU_CHAT_ID", "").strip()
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 LOG = Path("/tmp/bot-service.log")
@@ -89,28 +90,13 @@ def fetch_stock_quote(code: str) -> dict | None:
 
 def make_reply_card(title: str, color: str, lines: list[str], tag: str = "") -> str:
     """构造回复卡片 JSON。"""
-    elements = []
-    for line in lines:
-        elements.append({"tag": "markdown", "content": line})
-    elements.append({
+    card = message_card(title, color, lines, tag)
+    card["body"]["vertical_spacing"] = "8px"
+    card["body"]["elements"].append({
         "tag": "markdown",
         "content": "<font color='grey'>仅供研究参考，不构成个性化投资建议</font>",
         "text_size": "notation",
     })
-    text_tag = []
-    if tag:
-        text_tag.append({"tag": "text_tag", "text": {"tag": "plain_text", "content": tag}, "color": color})
-    card = {
-        "schema": "2.0",
-        "config": {"update_multi": True, "width_mode": "default"},
-        "header": {
-            "title": {"tag": "plain_text", "content": title},
-            "template": color,
-            "text_tag_list": text_tag,
-        },
-        "body": {"direction": "vertical", "padding": "12px 12px 20px 12px",
-                 "vertical_spacing": "8px", "elements": elements},
-    }
     return json.dumps(card, ensure_ascii=False)
 
 
@@ -148,6 +134,14 @@ def handle_query_stock(code: str) -> str:
         lines.append(f"止损价：{invalid} | 目标价：{target}")
     else:
         lines.append("<font color='grey'>当前无已确认实际持仓；策略假定持仓另行统计。</font>")
+    observations = [item for item in state.get("signal_observations", {}).values() if item["code"] == code]
+    if observations:
+        latest = max(observations, key=lambda item: item["as_of"])
+        lines.append(f"**最近扫描审核 · {latest['as_of']} · {latest['side']} · {latest['status']}**")
+        lines.append(latest["reason"])
+        lines.append("以上为历史扫描快照，不是本次查询重新生成的实时信号。")
+    else:
+        lines.append("暂无此股的AI信号审核记录；报价本身不代表通过筛选。")
 
     return make_reply_card(f"{name}({code})", color, lines, "持仓中" if holding else "自选股")
 
@@ -201,41 +195,14 @@ def parse_command(text: str) -> str:
 
 def send_reply(chat_id: str, card_json: str):
     """用 bot 身份回复卡片到群。"""
-    token_result = server_http_post(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        {"app_id": APP_ID, "app_secret": APP_SECRET},
-    )
-    token = token_result.get("tenant_access_token", "")
-    if not token:
-        raise RuntimeError(f"获取飞书 token 失败：{token_result.get('code')}")
-    result = server_http_post(
-        f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
-        {
-            "receive_id": chat_id,
-            "msg_type": "interactive",
-            "content": card_json,
-        },
-        token=token,
-    )
-    if result.get("code") != 0:
-        raise RuntimeError(f"飞书回复失败：{result.get('code')} {result.get('msg', '')}")
-
-
-def server_http_post(url: str, data: dict, token: str | None = None) -> dict:
-    import urllib.request
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    send_card(chat_id, card_json)
 
 
 def do_message(data: P2ImMessageReceiveV1) -> None:
     try:
         msg = data.event.message
         chat_id = msg.chat_id
-        if chat_id != TARGET_CHAT_ID or msg.message_type != "text":
+        if not TARGET_CHAT_ID or chat_id != TARGET_CHAT_ID or msg.message_type != "text":
             return
         content = json.loads(msg.content)
         text = content.get("text", "")
@@ -328,7 +295,7 @@ def card_response(payload: dict):
 
 def do_card_action(data: P2CardActionTrigger):
     try:
-        if data.event.context.open_chat_id != TARGET_CHAT_ID:
+        if not TARGET_CHAT_ID or data.event.context.open_chat_id != TARGET_CHAT_ID:
             raise ValueError("该会话不允许登记持仓")
         action = data.event.action
         value = action.value or {}
@@ -371,6 +338,7 @@ def do_card_action(data: P2CardActionTrigger):
 
 
 def main():
+    target_chat_id()
     import lark_oapi as lark
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     if not APP_ID or not APP_SECRET:

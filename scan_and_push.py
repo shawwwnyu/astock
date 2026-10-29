@@ -12,9 +12,10 @@ from datetime import datetime
 from pathlib import Path
 
 import server
+from feishu_client import target_chat_id
+from report_cards import signal_button
 
 PROJECT_DIR = Path(__file__).resolve().parent
-TARGET_CHAT_ID = "oc_4a44bf793473ba5dd87d50904065a92f"
 SHANGHAI = server.SHANGHAI
 SCAN_INTERVAL = 300
 
@@ -37,20 +38,6 @@ def command_result(result: subprocess.CompletedProcess) -> dict:
     return payload
 
 
-def signal_button(action: dict) -> dict:
-    side = action["side"]
-    label = "买入" if side == "buy" else "卖出"
-    return {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": f"登记实际{label} {action['name']}({action['code']})"},
-        "type": "default",
-        "behaviors": [{"type": "callback", "value": {
-            "action": f"confirm_{side}", "code": action["code"],
-            "signal_id": action["notification_fingerprint"],
-        }}],
-    }
-
-
 def kline_chart_element(code: str) -> dict | None:
     """获取近20日K线，生成 VChart 蜡烛图配置。"""
     try:
@@ -66,8 +53,8 @@ def kline_chart_element(code: str) -> dict | None:
                 "date": date_str,
                 "open": float(bar[1]),
                 "close": float(bar[2]),
-                "low": float(bar[3]),
-                "high": float(bar[4]),
+                "high": float(bar[3]),
+                "low": float(bar[4]),
             })
         spec = {
             "type": "candlestick",
@@ -77,7 +64,8 @@ def kline_chart_element(code: str) -> dict | None:
             "height": 180,
         }
         return {"tag": "chart", "spec": spec, "title": {"text": f"{code} 近20日K线"}}
-    except Exception:
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, IndexError) as error:
+        print(f"K线图获取失败 {code}: {error}", file=sys.stderr)
         return None
 
 
@@ -101,7 +89,7 @@ def build_signal_card(result: dict) -> dict:
             elements.append(chart)
         explain = analyze_buy_signal if action["side"] == "buy" else analyze_sell_signal
         try:
-            text = explain({key: action[key] for key in (
+            text = action["ai_review"]["reason"] if action.get("ai_review") else explain({key: action[key] for key in (
                 "side", "code", "name", "price", "invalidation", "resistance", "reasons",
             ) if key in action})
         except RuntimeError as error:
@@ -123,6 +111,7 @@ def build_signal_card(result: dict) -> dict:
 
 
 def scan_once() -> bool:
+    chat_id = target_chat_id()
     result = command_result(run([
         sys.executable, "-B", "server.py", "--lightclaw-scan-prepare", "--resume-pending",
     ]))
@@ -139,7 +128,7 @@ def scan_once() -> bool:
     if not result.get("delivery_message_id"):
         delivery_uuid = hashlib.sha256(result["event_id"].encode()).hexdigest()[:32]
         delivery = command_result(run([
-            sys.executable, "-B", "send_bot.py", TARGET_CHAT_ID,
+            sys.executable, "-B", "send_bot.py", chat_id,
             json.dumps(build_signal_card(result), ensure_ascii=False), "--uuid", delivery_uuid,
         ]))
         if delivery.get("code") != 0:
@@ -160,20 +149,24 @@ def check_position_risks() -> None:
         return
     risk_key = "position_risk_notified"
     notified = set(state.get(risk_key, []))
-    now_str = datetime.now(SHANGHAI).strftime("%Y%m%d")
+    now = datetime.now(SHANGHAI)
+    now_str = now.strftime("%Y%m%d")
     new_risks = []
     for h in holdings:
         if h.get("status") != "open":
             continue
         code = h["code"]
-        stop_loss = h.get("invalidation", 0)
-        if not stop_loss:
+        stop_loss = server.as_number(h.get("invalidation"))
+        if stop_loss is None or stop_loss <= 0:
             continue
         try:
             symbol = server.symbol_for(code)
             minute = server.fetch_minute(symbol)
-            price = minute["price"]
-        except Exception:
+            if minute.get("trade_date") != now_str:
+                raise ValueError("持仓行情不是当日数据")
+            price = server.parse_minute(minute, min(now.hour * 60 + now.minute, 900))["price"]
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            print(f"风险行情检查失败 {code}: {error}", file=sys.stderr)
             continue
         if price <= stop_loss:
             risk_id = f"{now_str}-{code}-stop"
@@ -183,13 +176,14 @@ def check_position_risks() -> None:
     if new_risks:
         elements = [{"tag": "markdown", "content": "**⚠️ 持仓风险预警**"}]
         for h in new_risks:
-            pnl_pct = (h["current_price"] - h["buy_price"]) / h["buy_price"] * 100
+            buy_price = server.as_number(h.get("buy_price"))
+            pnl_text = f"{(h['current_price'] / buy_price - 1) * 100:+.2f}%" if buy_price and buy_price > 0 else "无法计算"
             elements.append({
                 "tag": "markdown",
                 "content": f"**{h['name']}({h['code']})**\n"
                            f"现价：{h['current_price']:.2f} | 买入：{h['buy_price']:.2f} | "
-                           f"盈亏：{pnl_pct:+.2f}%\n"
-                           f"已跌破止损位 {h['invalidation']:.2f}，建议卖出止损",
+                           f"盈亏：{pnl_text}\n"
+                           f"已跌破止损位 {h['invalidation']:.2f}，请核对退出条件；当日买入受T+1限制。",
             })
         card = {
             "schema": "2.0",
@@ -197,13 +191,16 @@ def check_position_risks() -> None:
             "body": {"elements": elements},
         }
         delivery = command_result(run([
-            sys.executable, "-B", "send_bot.py", TARGET_CHAT_ID,
+            sys.executable, "-B", "send_bot.py", target_chat_id(),
             json.dumps(card, ensure_ascii=False),
         ]))
-        if delivery.get("code") == 0:
-            state[risk_key] = list(notified)
-            server.save_trading_state(state)
-            print(f"[{datetime.now(SHANGHAI):%H:%M}] 已推送持仓止损预警：{[h['code'] for h in new_risks]}")
+        if delivery.get("code") != 0 or not delivery.get("data", {}).get("message_id"):
+            raise RuntimeError("飞书未确认风险预警送达")
+        with server.trading_state_transaction() as path:
+            latest = server.load_trading_state(path)
+            latest[risk_key] = sorted(set(latest.get(risk_key, [])) | notified)
+            server.save_trading_state(latest, path)
+        print(f"[{datetime.now(SHANGHAI):%H:%M}] 已推送持仓止损预警：{[h['code'] for h in new_risks]}")
 
 
 def in_scan_window(now: datetime) -> bool:
@@ -232,7 +229,7 @@ def main() -> int:
                 print(f"扫描异常：{error}", file=sys.stderr)
             try:
                 check_position_risks()
-            except Exception as error:
+            except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
                 print(f"风险检查异常：{error}", file=sys.stderr)
         time.sleep(SCAN_INTERVAL)
     return 0

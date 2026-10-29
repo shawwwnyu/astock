@@ -91,3 +91,95 @@ def apply_update(state: dict, end: date, now: datetime) -> dict:
     revision = {**planned, "created_at": now.isoformat(timespec="seconds")}
     revisions.append(revision)
     return {**revision, "status": "applied" if planned["after"] != planned["before"] else "unchanged"}
+
+
+MIN_AI_SAMPLES = 10
+
+
+def plan_ai_update(state: dict, report: dict) -> dict:
+    """AI reviews evidence, but can change only the two authorized parameters."""
+    from ai_strategy import digest, reason, structured
+    import llm
+
+    end = date.fromisoformat(report["end"])
+    baseline = plan_update(state, end)
+    before = baseline["before"]
+    evidence = {
+        key: report[key] for key in ("start", "end", "period", "buys", "sells", "realized_pnl",
+                                     "period_pnl", "floating_pnl", "missing_data", "signal_review")
+    }
+    evidence["before"] = before
+    evidence["ledger_hash"] = digest([state["actual_holdings"], state["actual_history"]])
+    evidence["previous_adjustments"] = [
+        {key: item[key] for key in ("review_date", "effective_date", "before", "after", "reason")}
+        for item in state.get("strategy_adjustments", []) if item["review_date"] < report["end"]
+    ][-7:]
+    evidence_hash = digest(evidence)
+    cached = state.get("ai_reviews", {}).get(evidence_hash)
+    if cached:
+        return copy.deepcopy(cached)
+    planned = {
+        **baseline, "after": dict(before), "evidence_hash": evidence_hash,
+        "method": "ai-signal-review-v1", "model": llm.MODEL,
+        "period": report["period"], "period_start": report["start"], "period_end": report["end"],
+        "realized_pnl": report["realized_pnl"],
+        "ledger_hash": evidence["ledger_hash"],
+        "sample_count": len({
+            (sample["code"], sample["trade_date"], sample["side"])
+            for sample in report["signal_review"]["samples"]
+            if sample["matured"] and sample["status"] != "unavailable"
+        }),
+        "warning": "AI复盘不是回测验证，不保证提升收益。参数限2–3R及1–3个可卖交易日；每晚至多调整一次。",
+    }
+    try:
+        answer = structured(
+            "你是A股短线策略复盘员。评估已批准和被否决的买卖信号后1/2/3交易日方向表现，"
+            "区分实际成交盈亏与未成交的反事实表现，未到期或行情缺失不可算错。"
+            "分析误报、漏选风险、样本量和数据局限，不宣称必然改善。"
+            "按证据直接决定是否修改参数，非给用户操作建议。"
+            f"独立成熟样本不足{MIN_AI_SAMPLES}个或有数据缺失则保持不变。"
+            "只能改 minimum_reward_risk（2至3，每次最多0.2）和max_holding_sessions（1至3整数，每次最多1），"
+            "不得修改T+1、禁止加仓、仓位、数据公告核验。"
+            '返回 {"analysis":"复盘结论，最多600字","reason":"是否调整及证据，最多600字",'
+            '"after":{"minimum_reward_risk":2.0,"max_holding_sessions":3}}。',
+            evidence,
+        )
+        if set(answer) != {"analysis", "reason", "after"}:
+            raise ValueError("AI复盘字段无效")
+        after = validated(answer["after"])
+        if abs(after["minimum_reward_risk"] - before["minimum_reward_risk"]) > 0.200001 or abs(
+            after["max_holding_sessions"] - before["max_holding_sessions"]
+        ) > 1:
+            raise ValueError("AI调整幅度超出单次限制")
+        planned.update({"analysis": reason(answer["analysis"]), "reason": reason(answer["reason"]),
+                        "ai_status": "ok"})
+        if planned["sample_count"] < MIN_AI_SAMPLES or report["missing_data"] or report["signal_review"].get("missing_data"):
+            planned["reason"] = f"成熟独立样本不足{MIN_AI_SAMPLES}个或行情不完整，保持规则。" + planned["reason"]
+        else:
+            planned["after"] = after
+    except (RuntimeError, ValueError) as error:
+        import sys
+        print(f"[AI复盘] {error}；不修改规则", file=sys.stderr)
+        planned.update({"ai_status": "unavailable", "analysis": f"AI复盘不可用：{error}",
+                        "reason": "AI复盘不可用，保持现有规则，不回退到按盈亏机械调参。"})
+    return planned
+
+
+def apply_ai_update(state: dict, planned: dict, now: datetime) -> dict:
+    if planned["review_date"] != now.date().isoformat() or now.hour < 20:
+        raise ValueError("自动调参只允许北京时间当天20:00后执行")
+    revisions = state.setdefault("strategy_adjustments", [])
+    existing = next((item for item in revisions if item["review_date"] == planned["review_date"]), None)
+    if existing:
+        if existing.get("ledger_hash") and existing["ledger_hash"] != planned["ledger_hash"]:
+            raise ValueError("当晚调参后成交账本发生变化，停止再次修改；请核对记录")
+        return {**existing, "status": "already_applied"}
+    # Failed AI must not consume tonight's adjustment slot; a later retry can recover.
+    if planned["ai_status"] != "ok":
+        return {**planned, "status": "unavailable"}
+    validated(planned["after"])
+    if planned["after"] == planned["before"]:
+        return {**planned, "status": "unchanged"}
+    revision = {**planned, "created_at": now.isoformat(timespec="seconds")}
+    revisions.append(revision)
+    return {**revision, "status": "applied"}

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import server
 import trade_review
+import strategy_rules
 
 
 END = date(2026, 10, 28)
@@ -22,6 +23,11 @@ def lot(**changes):
 
 
 class TradeReviewTests(unittest.TestCase):
+    def setUp(self):
+        env = patch.dict("os.environ", {"FEISHU_CHAT_ID": "oc_test"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_daily_new_buy_uses_actual_cost_not_previous_close(self):
         state = server.empty_trading_state()
         state["actual_holdings"] = [lot()]
@@ -82,18 +88,23 @@ class TradeReviewTests(unittest.TestCase):
         with TemporaryDirectory() as directory, patch("server.TRADING_STATE_PATH", Path(directory) / "state.json"), \
              patch("sys.argv", ["trade_review.py", "--period", "daily", "--apply-rules"]), \
              patch("trade_review.close_prices", return_value={"300398": {"before": 28}}), \
+             patch("ai_strategy.structured", return_value={
+                 "analysis": "实际卖出亏损，但没有成熟信号样本。", "reason": "样本不足，保持规则。",
+                 "after": dict(strategy_rules.BASELINE),
+             }), \
              patch("trade_review.datetime") as clock:
             clock.now.return_value = night
             state = server.empty_trading_state()
             state["actual_history"] = [lot(buy_date="20261021", sell_date="20261028", sell_price=27)]
             server.save_trading_state(state)
-            for status in ("applied", "already_applied"):
+            for status in ("unchanged", "unchanged"):
                 with patch("sys.stdout", new_callable=io.StringIO) as output:
                     self.assertEqual(trade_review.main(), 0)
                 report = json.loads(output.getvalue())
                 self.assertEqual(report["rule_update"]["status"], status)
-                self.assertEqual(report["rule_update"]["after"]["minimum_reward_risk"], 2.2)
-            self.assertEqual(len(server.load_trading_state()["strategy_adjustments"]), 1)
+                self.assertEqual(report["rule_update"]["after"]["minimum_reward_risk"], 2.0)
+            self.assertEqual(len(server.load_trading_state()["strategy_adjustments"]), 0)
+            self.assertEqual(len(server.load_trading_state()["ai_reviews"]), 1)
 
     def test_historical_review_restores_later_sold_position(self):
         state = server.empty_trading_state()

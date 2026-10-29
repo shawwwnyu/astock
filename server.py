@@ -27,6 +27,8 @@ from statistics import fmean
 from typing import Any
 from zoneinfo import ZoneInfo
 from strategy_rules import effective_parameters
+from feishu_client import send_card, send_message, target_chat_id
+from report_cards import message_card, scheduled_card
 
 from weekly_review import (
     DEFAULT_PARAMETERS, STRATEGY_VERSION, archive_formal_event, archive_path_for,
@@ -85,8 +87,6 @@ TRADING_STATE_PATH = DATA_DIR / "trading-state.json"
 
 # 直接推送目标：邢晓渝个人飞书私信
 DEFAULT_RECEIVE_EMAIL = "xingxiaoyu@pjlab.org.cn"
-FEISHU_OPEN_API_BASE = "https://open.feishu.cn/open-apis"
-_token_cache: dict[str, Any] = {"token": "", "expires": 0.0}
 
 SCHEDULED_STAGES = {
     "open-summary": {
@@ -179,35 +179,6 @@ def validate_feishu_webhook(webhook: str) -> str:
     return webhook
 
 
-def get_tenant_access_token(app_id: str, app_secret: str) -> str:
-    """获取飞书自建应用 tenant_access_token，带进程内缓存。"""
-    app_id = app_id.strip()
-    app_secret = app_secret.strip()
-    if not app_id or not app_secret:
-        raise ValueError("缺少飞书应用 app_id 或 app_secret")
-    now = time.time()
-    cached = _token_cache.get("token", "")
-    if cached and now < _token_cache.get("expires", 0.0) - 120:
-        return cached
-    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
-    request = urllib.request.Request(
-        f"{FEISHU_OPEN_API_BASE}/auth/v3/tenant_access_token/internal",
-        data=body,
-        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    if result.get("code") != 0:
-        raise RuntimeError(f"获取飞书 tenant_access_token 失败：{result.get('msg', 'unknown')}")
-    token = str(result.get("tenant_access_token", ""))
-    if not token:
-        raise RuntimeError("飞书返回的 tenant_access_token 为空")
-    _token_cache["token"] = token
-    _token_cache["expires"] = now + int(result.get("expire", 7200))
-    return token
-
-
 def send_feishu_direct(
     message_text: str,
     app_id: str,
@@ -216,30 +187,11 @@ def send_feishu_direct(
     receive_id_type: str = "email",
 ) -> dict[str, Any]:
     """通过飞书自建应用直接给个人发私信（默认发给邢晓渝）。"""
-    token = get_tenant_access_token(app_id, app_secret)
     receive_id = receive_id.strip() or DEFAULT_RECEIVE_EMAIL
-    content = json.dumps({"text": message_text}, ensure_ascii=False)
-    body = json.dumps(
-        {"receive_id": receive_id, "msg_type": "text", "content": content},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    if len(body) > 50_000:
-        raise ValueError("飞书私信消息超过 50 KB 限制")
-    request = urllib.request.Request(
-        f"{FEISHU_OPEN_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}",
-        data=body,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
+    return send_message(
+        receive_id, "text", json.dumps({"text": message_text}, ensure_ascii=False),
+        receive_id_type=receive_id_type, app_id=app_id, app_secret=app_secret,
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    if result.get("code") != 0:
-        raise RuntimeError(f"飞书私信发送失败：{result.get('msg', 'unknown')}")
-    return result
 
 
 def load_push_config(include_secret: bool = False) -> dict[str, Any]:
@@ -335,6 +287,7 @@ def empty_trading_state() -> dict[str, Any]:
         "delivered_signals": {},
         "scan_deliveries": {},
         "strategy_adjustments": [],
+        "signal_observations": {},
     }
 
 
@@ -375,7 +328,7 @@ def load_trading_state(path: Path | None = None) -> dict[str, Any]:
     for key in ("holdings", "history", "processed_events", "committed_deliveries", "actual_holdings", "actual_history", "strategy_adjustments"):
         if not isinstance(normalized.get(key), list):
             raise RuntimeError(f"交易状态字段 {key} 格式无效")
-    for key in ("actual_trade_receipts", "delivered_signals", "scan_deliveries"):
+    for key in ("actual_trade_receipts", "delivered_signals", "scan_deliveries", "signal_observations"):
         if not isinstance(normalized[key], dict):
             raise RuntimeError(f"交易状态字段 {key} 格式无效")
     committed_tokens = normalized.get("committed_delivery_tokens")
@@ -549,8 +502,12 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
                 f">安排：下一交易日10:30复核；无卖点继续持有，第{max_sessions}个可卖交易日强制退出。",
                 "",
             ])
+            if stock.get("ai_review"):
+                lines.append(f">AI确认：{stock['ai_review']['reason']}")
         if not reviews and not buys:
             lines.append("**本次没有买点和卖点，不操作。**")
+            if analysis.get("ai_decision", {}).get("status") == "unavailable":
+                lines.append(">AI决策不可用，暂停新增买入及非硬性退出；硬性退出仍按规则执行。")
         elif reviews and not any(item["decision"] == "sell" for item in reviews) and not buys:
             lines.append("本次没有卖点，也不新增买入。")
         notes = report.get("notes", [])
@@ -558,7 +515,9 @@ def format_scheduled_message(report: dict[str, Any], test: bool = False) -> str:
             lines.append(f">{note}")
         lines.extend([
             "",
-            "飞书自定义机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。",
+            ("送达仅更新策略假定持仓；实际成交需在应用机器人表单中登记价格和股数。"
+             if "ai_decision" in analysis else
+             "飞书自定义机器人无法接收回复。本消息发送成功后，系统默认你按上述明确买入/卖出指令执行；持有、观察和空仓不产生交易。"),
         ])
     if "ai_sections" not in report:
         # 冻结 pending 必须能逐字重建，保留原格式及截断方式。
@@ -586,7 +545,7 @@ def send_feishu_push(
     receive_id: str | None = None,
 ) -> dict[str, Any]:
     config = load_push_config(include_secret=True)
-    # 优先走自建应用私信通道（直接发给邢晓渝个人）
+    # 配置会话时统一走应用机器人卡片，旧邮箱/Webhook入口仅兼容。
     app_id = (app_id or config.get("app_id") or os.environ.get("FEISHU_APP_ID", "")).strip()
     app_secret = (app_secret or config.get("app_secret") or os.environ.get("FEISHU_APP_SECRET", "")).strip()
     receive_id = (receive_id or config.get("receive_id") or os.environ.get("FEISHU_RECEIVE_ID", "")).strip()
@@ -598,6 +557,12 @@ def send_feishu_push(
     message = re.sub(r"^>\s?", "", markdown_message, flags=re.MULTILINE)
     message = re.sub(r"\*\*(.*?)\*\*", r"\1", message)
     message = re.sub(r"`([^`]*)`", r"\1", message)
+    if os.environ.get("FEISHU_CHAT_ID", "").strip():
+        card = scheduled_card(payload, markdown_message) if payload.get("report_type") == "scheduled" else message_card(
+            "A股短线雷达", "blue", [markdown_message],
+        )
+        return send_card(target_chat_id(), json.dumps(card, ensure_ascii=False),
+                         app_id=app_id, app_secret=app_secret)
     if app_id and app_secret:
         return send_feishu_direct(
             message, app_id=app_id, app_secret=app_secret,
@@ -672,7 +637,7 @@ def fetch_history_sina(symbol: str) -> dict[str, Any]:
             item.get("low", ""),
             item.get("volume", ""),
         ])
-    return {"symbol": symbol, "raw_rows": raw_rows}
+    return {"symbol": symbol, "raw_rows": raw_rows, "adjustment": "none"}
 
 
 def fetch_history(symbol: str) -> dict[str, Any]:
@@ -686,7 +651,7 @@ def fetch_history(symbol: str) -> dict[str, Any]:
         raw_rows = node.get("qfqday") or node.get("day") or []
         if not isinstance(raw_rows, list) or len(raw_rows) < 35:
             raise RuntimeError(f"insufficient history for {symbol}")
-        return {"symbol": symbol, "raw_rows": raw_rows}
+        return {"symbol": symbol, "raw_rows": raw_rows, "adjustment": "qfq" if node.get("qfqday") else "none"}
     except Exception:
         # 腾讯接口被 WAF 拦截或失败时，fallback 到新浪
         return fetch_history_sina(symbol)
@@ -1128,7 +1093,8 @@ def run_analysis(
     if not trade_dates:
         raise RuntimeError("实时分时行情全部获取失败")
     trade_date = max(trade_dates)
-    rule_parameters = effective_parameters(load_trading_state(), trade_date)
+    analysis_state = load_trading_state()
+    rule_parameters = effective_parameters(analysis_state, trade_date)
     phase, phase_label = determine_phase(now, trade_date)
     if stage:
         phase = stage
@@ -1212,6 +1178,41 @@ def run_analysis(
         item for item in strict_candidates
         if item["price"] * lot_size_for(item["code"]) <= CAPITAL * total_limit / 100
     ]
+    import ai_strategy
+    snapshot = {
+        "trade_date": trade_date, "market": market, "trading_dates": sorted(trading_dates),
+        "parameters": rule_parameters, "universe": securities,
+    }
+    fresh = trade_date == now.strftime("%Y%m%d") and all(
+        hhmm_to_minutes(str(row.get("last_time", ""))) >= cutoff_minutes for row in index_rows
+    ) and bool(index_rows)
+    rule_buys = [
+        ai_strategy.buy_evidence(item) for item in affordable
+        if actionable and fresh and hhmm_to_minutes(item["last_time"]) >= cutoff_minutes
+    ]
+    rule_sells = []
+    for review in review_holdings(analysis_state, snapshot):
+        holding = review["holding"]
+        stock = next((item for item in securities if item["code"] == holding["code"]), {})
+        if not entry_phase or review["decision"] != "sell" or not fresh or hhmm_to_minutes(stock.get("last_time", "")) < cutoff_minutes:
+            continue
+        rule_sells.append({
+            "holding_id": holding["id"], "code": holding["code"], "price": review["current_price"],
+            "reasons": review["reasons"], "stock": ai_strategy.buy_evidence(stock),
+            "hard_exit": ai_strategy.hard_exit(holding, stock, review["holding_session"],
+                                             rule_parameters["max_holding_sessions"], market),
+        })
+    ai_decision = ai_strategy.decide(
+        rule_buys, [item for item in rule_sells if not item["hard_exit"]], market, rule_parameters,
+        f"{trade_date}:{minutes_to_hhmm(cutoff_minutes)}",
+    )
+    approved = [row["code"] for row in ai_decision["buys"] if row["approve"]]
+    for stock in securities:
+        verdict = next((row for row in ai_decision["buys"] if row["code"] == stock["code"]), None)
+        if verdict:
+            stock["ai_review"] = verdict
+    affordable = sorted((item for item in affordable if item["code"] in approved),
+                        key=lambda item: approved.index(item["code"]))
     recommendations = affordable[:max_recommendations] if actionable else []
     while recommendations:
         per_budget = CAPITAL * total_limit / 100 / len(recommendations)
@@ -1241,7 +1242,9 @@ def run_analysis(
         per_position = 0
     elif entry_phase:
         decision, headline = "cash", "空仓，仓位 0%"
-        summary = f"没有股票同时通过市场、技术、分时、{rule_parameters['minimum_reward_risk']:g}R与公告硬门槛。"
+        summary = f"没有股票同时通过市场、技术、分时、{rule_parameters['minimum_reward_risk']:g}R、公告门槛与AI确认。"
+        if ai_decision["status"] == "unavailable":
+            summary = "AI决策不可用，暂停新增买入；硬性风控退出不受影响。"
         per_position = 0
     else:
         decision, headline = "cash", "当前不可新开仓"
@@ -1278,7 +1281,7 @@ def run_analysis(
                 "code", "name", "price", "change_pct", "score", "trend", "macd",
                 "reward_risk", "last_time", "failures", "eligible", "vwap",
                 "tail_return_pct", "tail_pullback_pct", "invalidation", "resistance",
-                "ma5", "ma10", "ma20", "dif", "dea",
+                "ma5", "ma10", "ma20", "dif", "dea", "ai_review",
             )
         })
     data_as_of = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]} {minutes_to_hhmm(cutoff_minutes)}"
@@ -1312,6 +1315,9 @@ def run_analysis(
         ).hexdigest(),
         "position_pct": round(sum(item["position_pct"] for item in display_candidates), 1),
         "candidates": display_candidates,
+        "ai_decision": ai_decision,
+        "rule_buy_signals": rule_buys,
+        "rule_sell_signals": rule_sells,
         "universe": universe,
         "errors": errors[:12],
         "sources": [
@@ -1530,6 +1536,13 @@ def review_holdings(state: dict[str, Any], analysis: dict[str, Any]) -> list[dic
         elif sell_reasons:
             decision = "sell"
             reasons = list(dict.fromkeys(sell_reasons))
+            if "ai_decision" in analysis:
+                from ai_strategy import hard_exit, sell_verdict
+                if not hard_exit(holding, stock, session_number, max_sessions, market):
+                    verdict = sell_verdict(analysis, str(holding.get("id", "")))
+                    if not verdict["approve"]:
+                        decision = "hold"
+                    reasons.append(f"AI审核：{verdict['reason']}")
         else:
             decision = "hold"
             reasons = ["未触发失效位、目标位或盘中转弱卖点"]
@@ -1814,6 +1827,9 @@ def build_intraday_scan_report(
             "reason_code": SCAN_REASON_CODES["buy"], "fingerprint": fingerprint,
             "stock": stock,
         })
+        if stock.get("ai_review"):
+            actions[-1]["reasons"].append(f"AI确认：{stock['ai_review']['reason']}")
+            actions[-1]["ai_review"] = copy.deepcopy(stock["ai_review"])
     actions.sort(key=lambda item: (0 if item["side"] == "sell" else 1, item["code"], item.get("holding_id", "")))
 
     previous = state.get("signal_states", {}) if state.get("signal_trade_date") == trade_date else {}
@@ -2133,15 +2149,21 @@ def lightclaw_scan_prepare(
                 "market_data_time": analysis.get("market_data_time", ""), "required_time": minutes_to_hhmm(cutoff),
             }
         report, next_states, evaluated = build_intraday_scan_report(analysis, state, now)
+        from signal_review import observe
+        observe(state, analysis, report["actions"])
         if not report["actions"]:
-            if state.get("signal_trade_date") != today or next_states != state.get("signal_states", {}):
+            if analysis.get("ai_decision") or state.get("signal_trade_date") != today or next_states != state.get("signal_states", {}):
                 state["signal_trade_date"] = today
                 state["signal_states"] = next_states
                 state["updated_at"] = now.isoformat(timespec="seconds")
                 save_trading_state(state, locked_path)
             return {
-                "status": "no_signal", "reason": "信号状态未变化",
+                "status": "no_signal", "reason": (
+                    "AI决策不可用，暂停新增买入及非硬性退出" if analysis.get("ai_decision", {}).get("status") == "unavailable"
+                    else "信号状态未变化"
+                ),
                 "trade_date": today, "evaluated_symbols": len(evaluated),
+                "ai_status": analysis.get("ai_decision", {}).get("status", "legacy"),
             }
         token = secrets.token_urlsafe(32)
         message = format_intraday_scan_message(report)
@@ -2210,6 +2232,9 @@ def lightclaw_prepare(
                 "required_time": minutes_to_hhmm(required_minutes),
             }
         report = build_scheduled_report(stage, analysis, state)
+        if not test_message:
+            from signal_review import observe
+            observe(state, analysis, [])
         message = format_lightclaw_message(report, test=test_message)
         token = secrets.token_urlsafe(32)
         state["pending_report"] = _build_pending(
@@ -2374,6 +2399,8 @@ def scheduled_push(
             return conflict
         report = build_scheduled_report(stage, analysis, state, manual_holdings)
         report = enrich_summary_report(report, state, ai_sections)
+        from signal_review import observe
+        observe(state, analysis, [])
         minute_rows = persistence_data.get("minute_rows")
         if minute_rows is not None:
             persist_decision(analysis, minute_rows)
@@ -2597,94 +2624,7 @@ def main() -> int:
             report = enrich_summary_report(report, state, ai_sections)
             report["ai_sections"] = ai_sections
 
-            # 构造飞书卡片 2.0 JSON
-            market = analysis.get("market", {})
-            market_label = market.get("label", "未核验")
-            market_summary = market.get("summary", "")
-            is_red = market.get("state") == "red"
-            header_template = "red" if is_red else ("green" if market.get("state") == "green" else "yellow")
-
-            indices = analysis.get("indices", [])
-            breadth = analysis.get("breadth", {})
-
-            def fmt_pct(v):
-                if v is None:
-                    return "—"
-                sign = "+" if v > 0 else ""
-                return f"{sign}{v:.2f}%"
-
-            def pct_color(v):
-                if v is None or v == 0:
-                    return "grey"
-                return "green" if v > 0 else "red"
-
-            # 指数指标列（取前4个）
-            index_columns = []
-            for idx in indices[:4]:
-                chg = idx.get("change_pct")
-                color = pct_color(chg)
-                index_columns.append({
-                    "tag": "column", "width": "weighted", "weight": 1,
-                    "background_style": f"{color}-50", "padding": "12px", "vertical_spacing": "2px",
-                    "elements": [
-                        {"tag": "markdown", "content": f"**{idx.get('name','')}**", "text_align": "center"},
-                        {"tag": "markdown", "content": f"## <font color='{color}'>{idx.get('price','—')}</font>", "text_align": "center"},
-                        {"tag": "markdown", "content": f"<font color='grey'>{fmt_pct(chg)}</font>", "text_align": "center", "text_size": "notation"},
-                    ],
-                })
-
-            up = breadth.get("up", 0)
-            down = breadth.get("down", 0)
-            flat = breadth.get("flat", 0)
-            avg_chg = breadth.get("average_change_pct")
-
-            breadth_columns = [
-                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
-                 "elements": [{"tag": "markdown", "content": f"<font color='green'>上涨 {up}</font>", "text_align": "center"}]},
-                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
-                 "elements": [{"tag": "markdown", "content": f"<font color='red'>下跌 {down}</font>", "text_align": "center"}]},
-                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
-                 "elements": [{"tag": "markdown", "content": f"<font color='grey'>平盘 {flat}</font>", "text_align": "center"}]},
-                {"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "12px", "vertical_spacing": "2px",
-                 "elements": [{"tag": "markdown", "content": f"**平均 {fmt_pct(avg_chg)}**", "text_align": "center"}]},
-            ]
-
-            elements = []
-            if index_columns:
-                elements.append({
-                    "tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
-                    "columns": index_columns,
-                })
-            elements.append({
-                "tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
-                "columns": breadth_columns,
-            })
-
-            elements.append({"tag": "markdown", "content": format_scheduled_message(report)})
-
-            elements.append({
-                "tag": "markdown",
-                "content": f"<font color='grey'>{market_summary} · 仅供研究参考，不构成个性化投资建议</font>",
-                "text_size": "notation",
-            })
-
-            card = {
-                "schema": "2.0",
-                "config": {"update_multi": True, "width_mode": "default"},
-                "header": {
-                    "title": {"tag": "plain_text", "content": f"A股{report.get('label', '收盘总结')}"},
-                    "subtitle": {"tag": "plain_text", "content": f"{analysis.get('trade_date','')} · 数据截至 {analysis.get('data_as_of','')}"},
-                    "template": header_template,
-                    "icon": {"tag": "standard_icon", "token": "calendar_colorful"},
-                    "text_tag_list": [
-                        {"tag": "text_tag", "text": {"tag": "plain_text", "content": market_label}, "color": header_template}
-                    ],
-                },
-                "body": {
-                    "direction": "vertical", "padding": "12px 12px 20px 12px",
-                    "vertical_spacing": "12px", "elements": elements,
-                },
-            }
+            card = scheduled_card(report, format_scheduled_message(report))
             print(json.dumps(card, ensure_ascii=False))
             return 0
         except Exception as error:

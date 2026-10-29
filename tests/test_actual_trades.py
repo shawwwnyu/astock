@@ -19,6 +19,9 @@ from tests.test_delivery import NOW, prepare
 
 class ActualTradeTests(unittest.TestCase):
     def setUp(self):
+        chat = patch("bot_ws.TARGET_CHAT_ID", "oc_test")
+        chat.start()
+        self.addCleanup(chat.stop)
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "state.json"
@@ -171,7 +174,7 @@ class ActualTradeTests(unittest.TestCase):
         self.assertEqual(review["decision"], "hold")
 
     @staticmethod
-    def event(*, name="", value=None, form=None, chat=bot_ws.TARGET_CHAT_ID):
+    def event(*, name="", value=None, form=None, chat="oc_test"):
         return SimpleNamespace(event=SimpleNamespace(
             context=SimpleNamespace(open_chat_id=chat),
             action=SimpleNamespace(name=name, value=value, form_value=form),
@@ -234,6 +237,5 @@ class ActualTradeTests(unittest.TestCase):
         sender.assert_not_called()
 
     def test_send_reply_raises_on_token_or_send_business_failure(self):
-        for results in ([{"code": 123}], [{"tenant_access_token": "token"}, {"code": 123}]):
-            with patch("bot_ws.server_http_post", side_effect=results), self.assertRaises(RuntimeError):
-                bot_ws.send_reply(bot_ws.TARGET_CHAT_ID, "{}")
+        with patch("bot_ws.send_card", side_effect=RuntimeError("发送失败")), self.assertRaises(RuntimeError):
+            bot_ws.send_reply(bot_ws.TARGET_CHAT_ID, "{}")
